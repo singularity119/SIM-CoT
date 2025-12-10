@@ -36,6 +36,55 @@ import gc
 import argparse
 import functools
 from utils import Config, set_seed
+
+import json
+
+def load_gsm_file(path):
+    """Load GSM-style json and return a list of dict samples."""
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    # 情况1: 顶层是dict
+    if isinstance(data, dict):
+        # 1) 先试试常见字段里有没有list
+        for key in ["train", "test", "validation", "valid", "data", "samples"]:
+            if key in data and isinstance(data[key], list):
+                data = data[key]
+                break
+        else:
+            # 2) 如果没有list字段,但value们本身就是一个个sample dict
+            values = list(data.values())
+            if len(values) > 0 and all(isinstance(v, dict) for v in values):
+                data = values
+            else:
+                # 实在看不懂,就直接包成单元素list,后面用的时候会报更具体的KeyError
+                data = [data]
+
+    # 情况2: 顶层不是list也不是dict,直接包一下
+    if not isinstance(data, list):
+        data = [data]
+
+    return data
+
+
+def extract_qa(d):
+    """兼容几种字段命名：question/answer 或 input/output"""
+    if "question" in d:
+        q = d["question"]
+    elif "input" in d:
+        q = d["input"]
+    else:
+        raise KeyError(f"No question/input field in sample: {d.keys()}")
+
+    if "answer" in d:
+        a = d["answer"]
+    elif "output" in d:
+        a = d["output"]
+    else:
+        raise KeyError(f"No answer/output field in sample: {d.keys()}")
+
+    return q, a
+
 def check_requires_grad(model):
     for name, param in model.named_parameters():
         print(name)
@@ -130,9 +179,11 @@ def main():
     start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
 
-    loaded = False
+    loaded = False          # 新增：标记有没有真正 load 过权重
+    saved_weights = None    # 新增：默认没有 checkpoint
 
-    if configs.load_model_path != "None":
+    # if configs.load_model_path != "None":
+    if configs.load_model_path not in [None, "", "None"]:
         saved_weights = torch.load(
             configs.load_model_path, map_location="cpu"
         )
@@ -162,6 +213,9 @@ def main():
             loaded = True
             print(model.load_state_dict(saved_weights, strict=False))
 
+    else:
+        print("No load_model_path provided, training from scratch.")
+
     if not (configs.cot or configs.no_thoughts or configs.no_cot):
         # if we need new tokens, initialize their embeddings and lm heads
         model.resize_token_embeddings(len(tokenizer))
@@ -189,7 +243,12 @@ def main():
             raise ValueError(f"don't support model {configs.mode=}")
 
     if configs.load_model_path != "None" and not loaded:
-        print(model.load_state_dict(saved_weights, strict=False))
+        # print(model.load_state_dict(saved_weights, strict=False))
+        if saved_weights is not None and not loaded:
+            print("Loading weights (post init)...")
+            print(model.load_state_dict(saved_weights, strict=False))
+        else:
+            print("No checkpoint to load after init, start training from scratch.")
 
     print(f"Running FSDP on rank = {rank}, world size = {world_size}")
     model = model.to(local_rank)
@@ -220,12 +279,50 @@ def main():
         print(parallel_model)
     check_requires_grad(parallel_model.module)
 
+    # # prepare the ground truth answer and cot for evaluation
+    # question_val = [d["question"] for d in json.load(open(configs.val_path))]
+    # answers_val = [
+    #     d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))
+    # ]
+    # cot_val = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
+
     # prepare the ground truth answer and cot for evaluation
-    question_val = [d["question"] for d in json.load(open(configs.val_path))]
-    answers_val = [
-        d["answer"].replace(",", "").strip() for d in json.load(open(configs.val_path))
-    ]
-    cot_val = ["\n".join(d["steps"]) for d in json.load(open(configs.val_path))]
+    # 使用更鲁棒的方式读取 gsm8k_aug
+    val_data = load_gsm_file(configs.val_path)
+
+    question_val = []
+    answers_val = []
+    cot_val = []
+
+    for d in val_data:
+        # 问题字段：优先用 question，其次尝试 input
+        if "question" in d:
+            q = d["question"]
+        elif "input" in d:
+            q = d["input"]
+        else:
+            raise KeyError(f"No question/input field in sample: {d.keys()}")
+
+        # 答案字段：优先用 answer，其次尝试 output
+        if "answer" in d:
+            a = d["answer"]
+        elif "output" in d:
+            a = d["output"]
+        else:
+            raise KeyError(f"No answer/output field in sample: {d.keys()}")
+
+        # CoT 字段：如果有 steps/cot 就用，没有就用空串占位
+        if "steps" in d and isinstance(d["steps"], list):
+            c = "\n".join(d["steps"])
+        elif "cot" in d:
+            c = d["cot"]
+        else:
+            c = ""
+
+        question_val.append(q)
+        answers_val.append(str(a).replace(",", "").strip())
+        cot_val.append(c)
+
 
     base_dataset_valid = get_dataset(
         configs.val_path, tokenizer, max_size=32 if configs.debug else 100000000

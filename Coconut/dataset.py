@@ -37,7 +37,53 @@ def get_dataset(path, tokenizer, max_size=1000000000):
         }
         return sample
 
-    data = json.load(open(path))[:max_size]
+    # 先把JSON读进来
+    with open(path, "r") as f:
+        raw = json.load(f)
+
+    # 情况1：顶层是 dict，且包含 question / cot / answer 这几个字段
+    if (
+        isinstance(raw, dict)
+        and all(k in raw for k in ["question", "cot", "answer"])
+        and all(isinstance(raw[k], list) for k in ["question", "cot", "answer"])
+    ):
+        n = len(raw["question"])
+        data = []
+        for i in range(n):
+            q = raw["question"][i]
+            cot_i = raw["cot"][i]
+            ans = raw["answer"][i]
+
+            # cot 可能是字符串，也可能已经是一个步列表
+            if isinstance(cot_i, str):
+                steps = [cot_i]
+            elif isinstance(cot_i, list):
+                steps = cot_i
+            else:
+                raise ValueError(
+                    f"Unsupported cot element type: {type(cot_i)} at index {i}"
+                )
+
+            data.append(
+                {
+                    "question": q,
+                    "steps": steps,
+                    "answer": ans,
+                }
+            )
+
+    # 情况2：顶层原本就是 list（比如原始Coconut格式）
+    elif isinstance(raw, list):
+        data = raw
+
+    # 其他结构，一律报错
+    else:
+        raise ValueError(
+            f"Unsupported data format in {path}, top-level type={type(raw)}, keys={list(raw.keys()) if isinstance(raw, dict) else None}"
+        )
+
+    # 截断到 max_size，并加 idx
+    data = data[: int(max_size)]
     data = [{**d, "idx": idx} for idx, d in enumerate(data)]
 
     keys = data[0].keys()
@@ -54,7 +100,6 @@ def get_dataset(path, tokenizer, max_size=1000000000):
             processed_dataset = [None]
         dist.broadcast_object_list(processed_dataset, src=0)
         dataset = processed_dataset[0]
-
     else:
         dataset = dataset.map(
             tokenize_sample, remove_columns=list(dataset.features), num_proc=32
@@ -74,6 +119,7 @@ def get_dataset(path, tokenizer, max_size=1000000000):
     # )
 
     return dataset
+
 
 @dataclass
 class MyExplainableCollator:

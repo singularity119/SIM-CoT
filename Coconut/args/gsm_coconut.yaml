@@ -23,17 +23,23 @@ save_only_improve: False
 uniform_prob: 0.0
 
 # Model and checkpoint paths (use relative paths or env variables)
-model_id: ./pretrained/gpt2
-load_model_path: ./ckpts/gsm_cot/checkpoint_20
+#model_id: ./pretrained/gpt2
+model_id: /share/xuyinlong/huangxutao/models/llama3.2_1b_instruct/origin_model
+#load_model_path: ./ckpts/gsm_cot/checkpoint_20
+load_model_path:
 
 wandb: False
 seed: 0
-resume: 3
+# resume: 3
+resume: 0
 bf16: False
 
 # for debug
-train_path: ./data/gsm_train.json
-val_path: ./data/gsm_test.json
+# train_path: ./data/gsm_train.json 
+# val_path: ./data/gsm_test.json
+train_path: /share/xuyinlong/huangxutao/datasets/gsm8k_aug/train.json
+val_path: /share/xuyinlong/huangxutao/datasets/gsm8k_aug/test.json
+
 
 reset_optimizer: True
 batch_size_training: 8
