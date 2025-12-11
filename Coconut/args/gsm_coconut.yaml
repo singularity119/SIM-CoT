@@ -24,7 +24,8 @@ uniform_prob: 0.0
 
 # Model and checkpoint paths (use relative paths or env variables)
 #model_id: ./pretrained/gpt2
-model_id: /share/xuyinlong/huangxutao/models/llama3.2_1b_instruct/origin_model
+#model_id: /share/xuyinlong/huangxutao/models/llama3.2_1b_instruct/origin_model
+model_id: /root/autodl-tmp/models/llama3.2_1b_instruct/origin_model
 #load_model_path: ./ckpts/gsm_cot/checkpoint_20
 load_model_path:
 
@@ -32,19 +33,22 @@ wandb: False
 seed: 0
 # resume: 3
 resume: 0
-bf16: False
+# bf16: False
+bf16: True
 
 # for debug
 # train_path: ./data/gsm_train.json 
 # val_path: ./data/gsm_test.json
-train_path: /share/xuyinlong/huangxutao/datasets/gsm8k_aug/train.json
-val_path: /share/xuyinlong/huangxutao/datasets/gsm8k_aug/test.json
+# train_path: /share/xuyinlong/huangxutao/datasets/gsm8k_aug/train.json
+# val_path: /share/xuyinlong/huangxutao/datasets/gsm8k_aug/test.json
+train_path: /root/autodl-tmp/datasets/gsm8k_aug/train.json
+val_path: /root/autodl-tmp/datasets/gsm8k_aug/test.json
 
 
 reset_optimizer: True
 batch_size_training: 8
 debug: False
-gradient_accumulation_steps: 2
+gradient_accumulation_steps: 4
 num_epochs: 25
 lr: !!float "1e-4"
 weight_decay: 0.01
