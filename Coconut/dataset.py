@@ -13,25 +13,6 @@ from datasets import Dataset
 from transformers import PreTrainedTokenizerBase
 from transformers.data.data_collator import pad_without_fast_tokenizer_warning
 
-# === 辅助函数：安全的分布式 Map ===
-def safe_map(dataset, func, **kwargs):
-    """
-    让 Rank 0 先处理并写入缓存，其他 Rank 等待。
-    避免多进程同时写缓存导致 SIGABRT 崩溃。
-    """
-    # 如果是分布式环境，非 0 号卡先等待
-    if dist.is_initialized() and dist.get_rank() != 0:
-        dist.barrier()
-
-    # 执行 map (Rank 0 会计算写入，其他人后续会直接读缓存)
-    mapped_dataset = dataset.map(func, **kwargs)
-
-    # Rank 0 处理完后，解除等待
-    if dist.is_initialized() and dist.get_rank() == 0:
-        dist.barrier()
-        
-    return mapped_dataset
-# =================================
 
 def get_dataset(path, tokenizer, max_size=1000000000):
 
@@ -108,11 +89,21 @@ def get_dataset(path, tokenizer, max_size=1000000000):
     keys = data[0].keys()
     dataset = Dataset.from_dict({k: [d[k] for d in data] for k in keys})
 
-    # ================= 修改 1: 使用 safe_map =================
-    dataset = safe_map(
-        dataset, tokenize_sample, remove_columns=list(dataset.features), num_proc=1
-    )
-    # =======================================================
+    if torch.cuda.device_count() > 1:
+        if dist.get_rank() == 0:
+            processed_dataset = [
+                dataset.map(
+                    tokenize_sample, remove_columns=list(dataset.features), num_proc=32
+                )
+            ]
+        else:
+            processed_dataset = [None]
+        dist.broadcast_object_list(processed_dataset, src=0)
+        dataset = processed_dataset[0]
+    else:
+        dataset = dataset.map(
+            tokenize_sample, remove_columns=list(dataset.features), num_proc=32
+        )
 
     # verify
     d = data[0]
@@ -120,7 +111,13 @@ def get_dataset(path, tokenizer, max_size=1000000000):
     complete_tokenized = tokenizer.encode(complete, add_special_tokens=True) + [
         tokenizer.eos_token_id
     ]
-    
+    # assert (
+    #     complete_tokenized
+    #     == dataset[0]["question_tokenized"]
+    #     + list(itertools.chain.from_iterable(dataset[0]["steps_tokenized"]))
+    #     + dataset[0]["answer_tokenized"]
+    # )
+
     return dataset
 
 
@@ -274,7 +271,6 @@ class MyExplainableCollator:
             batch["position_ids"] = torch.tensor(
                 batch["position_ids"], dtype=torch.int64
             )
-
         return batch
 
 @dataclass
@@ -423,11 +419,9 @@ def get_question_latent_dataset(
             "position_ids": list(range(len(tokens))),
         }
 
-    # ================= 修改 2: 使用 safe_map =================
-    return safe_map(
-        base_dataset_valid, process_dataset, remove_columns=list(base_dataset_valid.features), num_proc=1
+    return base_dataset_valid.map(
+        process_dataset, remove_columns=list(base_dataset_valid.features), num_proc=32
     )
-    # =======================================================
 
 
 def get_cot_latent_dataset(
@@ -504,15 +498,28 @@ def get_cot_latent_dataset(
             "position_ids": list(range(len(tokens))),
         }
 
-    # ================= 修改 3: 使用 safe_map =================
-    processed_dataset = safe_map(
-        base_dataset, process_dataset, remove_columns=list(base_dataset.features), num_proc=1
-    )
-    if shuffle:
-        processed_dataset = processed_dataset.shuffle()
-    
-    return processed_dataset
-    # =======================================================
+    if torch.cuda.device_count() > 1:
+        if dist.get_rank() == 0:
+            processed_dataset = base_dataset.map(
+                process_dataset, remove_columns=list(base_dataset.features), num_proc=32
+            )
+            if shuffle:
+                processed_dataset = processed_dataset.shuffle()
+            processed_dataset = [processed_dataset]
+        else:
+            processed_dataset = [None]
+        dist.broadcast_object_list(processed_dataset, src=0)
+        dataset = processed_dataset[0]
+
+    else:
+        processed_dataset = base_dataset.map(
+            process_dataset, remove_columns=list(base_dataset.features), num_proc=32
+        )
+        if shuffle:
+            processed_dataset = processed_dataset.shuffle()
+        dataset = processed_dataset
+
+    return dataset
 
 
 
@@ -638,12 +645,25 @@ def get_cot_with_explainable_latent_dataset(
             "position_ids": list(range(len(tokens))),
         }
 
-    # ================= 修改 4: 使用 safe_map =================
-    processed_dataset = safe_map(
-        base_dataset, process_dataset, remove_columns=list(base_dataset.features), num_proc=1
-    )
-    if shuffle:
-        processed_dataset = processed_dataset.shuffle()
-    
-    return processed_dataset
-    # =======================================================
+    if torch.cuda.device_count() > 1:
+        if dist.get_rank() == 0:
+            processed_dataset = base_dataset.map(
+                process_dataset, remove_columns=list(base_dataset.features), num_proc=32
+            )
+            if shuffle:
+                processed_dataset = processed_dataset.shuffle()
+            processed_dataset = [processed_dataset]
+        else:
+            processed_dataset = [None]
+        dist.broadcast_object_list(processed_dataset, src=0)
+        dataset = processed_dataset[0]
+
+    else:
+        processed_dataset = base_dataset.map(
+            process_dataset, remove_columns=list(base_dataset.features), num_proc=32
+        )
+        if shuffle:
+            processed_dataset = processed_dataset.shuffle()
+        dataset = processed_dataset
+
+    return dataset
