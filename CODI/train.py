@@ -267,7 +267,8 @@ def train():
 
             token_nums = []
             # import pdb; pdb.set_trace()
-            raw_data = read_json('/mnt/shared-storage-user/weixilin/MLLM/coconut/data/gsm_train_clean.json')            
+            raw_data = read_json('/root/autodl-tmp/datasets/gsm8k_aug_CODI_clean/gsm_train_clean.json') 
+            #raw_data = raw_data[:1000]           
             for num_iter, example in tqdm(enumerate(raw_data)):
                 if 'cot' not in example: 
                     example['cot'] = example['steps']
