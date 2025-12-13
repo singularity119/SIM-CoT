@@ -59,11 +59,11 @@ def main():
     # 3. 保存结果
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     
-    print(f"💾 正在保存到: {OUTPUT_FILE} ...")
+    print(f"正在保存到: {OUTPUT_FILE} ...")
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
         json.dump(formatted_data, f, indent=4, ensure_ascii=False)
 
-    print(f"✅ 完成！共处理 {len(formatted_data)} 条数据。")
+    print(f"完成！共处理 {len(formatted_data)} 条数据。")
     print("-" * 30)
     print("数据样例 (第一条):")
     print(json.dumps(formatted_data[0], indent=2, ensure_ascii=False))

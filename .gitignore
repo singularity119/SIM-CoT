@@ -205,3 +205,17 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 忽略训练输出目录
+CODI/outputs/
+outputs/
+
+# 忽略所有巨大的模型权重文件
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# 忽略数据集解压文件 (如果不需要提交)
+CODI/datasets/*.json

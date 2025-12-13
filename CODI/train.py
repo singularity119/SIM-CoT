@@ -269,7 +269,7 @@ def train():
             # import pdb; pdb.set_trace()
             #raw_data = read_json('/mnt/shared-storage-user/weixilin/MLLM/coconut/data/gsm_train_clean.json')
             raw_data = read_json('/data2/huangxutao/projects/SIM-CoT/CODI/datasets/gsm_train_clean.json')  
-            raw_data = raw_data[:1000]          
+            # raw_data = raw_data[:200]          
             for num_iter, example in tqdm(enumerate(raw_data)):
                 if 'cot' not in example: 
                     example['cot'] = example['steps']

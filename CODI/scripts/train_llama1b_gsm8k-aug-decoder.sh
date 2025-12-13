@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,2,3,4,5
+export CUDA_VISIBLE_DEVICES=2,3,4,5
 export MODEL_PATH="/data2/huangxutao/projects/SIM-CoT/models/llama3.2_1b_instruct/origin_model"
 
 #SAVE_DIR=/mnt/shared-storage-user/weixilin/MLLM/coconut/codi/outputs
@@ -50,7 +50,7 @@ echo "Running SIM-CoT training on GPUs: $CUDA_VISIBLE_DEVICES"
 # 	--use_decoder True
 
 # 使用 torchrun 进行分布式并行训练 (DDP)，nproc_per_node=5 对应 5 张卡
-torchrun --nproc_per_node=5 --master_port=29500 train.py \
+torchrun --nproc_per_node=4 --master_port=29500 train.py \
     --output_dir "$SAVE_DIR" \
     --expt_name gsm8k_llama1b_SIM-CoT \
     --logging_dir "$SAVE_DIR/logs" \

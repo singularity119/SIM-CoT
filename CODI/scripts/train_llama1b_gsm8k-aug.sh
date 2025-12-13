@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0,2,3,4,5
+export CUDA_VISIBLE_DEVICES=2,3,4,5
 
 
 #SAVE_DIR=/ephemeral/codi_llama1b_full
@@ -46,7 +46,7 @@ mkdir -p "$SAVE_DIR"
 # 	--print_ref_model_stats True \
 # 	--max_token_num 200
 
-torchrun --nproc_per_node=5 --master_port=29500 train.py \
+torchrun --nproc_per_node=4 --master_port=29500 train.py \
     --output_dir "$SAVE_DIR" \
     --expt_name gsm8k_llama1b_latent_baseline \
     --logging_dir "$SAVE_DIR/logs" \
