@@ -1,26 +1,39 @@
 experiment:
   mode: core
   host: simcot
-  backbone: lsp
+  backbone: coconut
   use_lsp_jepa: true
-  run_kind: pr10_mvp_full_data_readiness_scan
+  run_kind: pr11_mvp_full_seq_debug_train
 
 data:
+  autodl_root: /root/autodl-tmp
+  cache_dir: /root/autodl-tmp/lsp_jepa/data
+  local_dataset_path: /root/autodl-tmp/lsp_jepa/data/gsm8k_train.jsonl
   dataset_source: gsm8k
   dataset_id: openai/gsm8k
   dataset_config: main
   dataset_split: train
   hf_endpoint: https://hf-mirror.com
   expected_samples: 7473
+  max_samples: null
   data_path: null
+  max_teacher_length: 512
+  min_samples: 7473
 
-scan:
-  script: lsp_jepa/scripts/scan_lsp_full_data.py
-  output_path: lsp_jepa/runs/pr10_mvp/full_data_readiness_report.json
-  tokenizer_id: openai-community/gpt2
+training:
+  script: lsp_jepa/scripts/train_lsp_jepa_core.py
+  output_dir: /root/autodl-tmp/lsp_jepa/runs/pr11_mvp/full_seq_debug/max_steps_100
+  checkpoint_dir: /root/autodl-tmp/lsp_jepa/runs/pr11_mvp/full_seq_debug/max_steps_100/checkpoints
+  save_checkpoints: true
+  max_steps: 100
+  supported_max_steps: [100, 500]
   batch_size: 16
-  configured_max_seq_len: 512
-  max_skipped_ids: 100
+  save_every: 100
+  log_every: 10
+  lr: 0.001
+  weight_decay: 0.0
+  drop_last: true
+  shuffle: true
 
 teacher:
   ema_decay: 0.995
@@ -29,6 +42,7 @@ teacher:
   target_layer: last_2
   target_pooling: step_last_token
   target_space: projected_hidden
+  target_position: final_valid_reasoning_step
   exclude_answer_tokens: true
   exclude_answer_prefix: true
   reasoning_step_filter: exclude_answer_only_steps
@@ -43,6 +57,7 @@ student:
   detach_between_steps: false
 
 lsp_objective:
+  objective: lsp_state
   type: state
   state_offset: 0
   transition_weight: 0.0
@@ -55,12 +70,12 @@ mapping:
 loss:
   alignment: normalized_mse
   align_weight: 1.0
-  anti_collapse: none
-  anti_collapse_weight: 0.0
+  anti_collapse: variance
+  anti_collapse_weight: 0.01
   answer_readout_weight: 0.0
 
 host_losses:
-  host_answer_ce_weight: 0.0
+  host_answer_ce_weight: 0.1
   codi_distill_weight: 0.0
   simcot_decoder_weight: 0.0
   intermediate_cot_ce_weight: 0.0
@@ -72,10 +87,9 @@ logging:
   log_host_losses: true
 
 optimization_contract:
-  no_training: true
-  no_backward: true
-  no_optimizer_step: true
-  no_ema_update: true
   no_step_level_training: true
-  no_attention_or_soft_dtw: true
-  no_looped_student: true
+  no_adapter_expansion: true
+  single_backward_per_batch: true
+  ema_update_after_optimizer_step: true
+  allow_empty_latents: false
+  allow_empty_teacher_targets: false

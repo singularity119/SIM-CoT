@@ -4,3 +4,4 @@
 torch>=2.5
 transformers>=4.46
 datasets>=2.19
+PyYAML>=6.0
