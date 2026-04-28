@@ -1,0 +1,173 @@
+{
+  "acceptance": {
+    "answer_leakage_default_zero": true,
+    "empty_teacher_target_rate_zero": true,
+    "full_expected_sample_count_reached": true,
+    "json_report_written": true,
+    "no_optimizer_step": true,
+    "script_completed": true
+  },
+  "answer_leakage": {
+    "answer_leakage_count": 0,
+    "answer_leakage_rate": 0.0,
+    "answer_leakage_reason_counts": {},
+    "answer_value_occurs_in_reasoning_count": 7464,
+    "answer_value_occurs_in_reasoning_note": "Informational only: final numeric values inside retained reasoning steps are not counted as leakage unless answer markers/prefixes or answer-only steps remain."
+  },
+  "config": {
+    "batch_size": 16,
+    "configured_max_seq_len": 512,
+    "data_path": null,
+    "dataset_config": "main",
+    "dataset_id": "openai/gsm8k",
+    "dataset_source": "gsm8k",
+    "dataset_split": "train",
+    "expected_samples": 7473,
+    "hf_endpoint": "https://hf-mirror.com",
+    "max_samples": null,
+    "num_latent_steps": 4,
+    "tokenizer_id": "openai-community/gpt2"
+  },
+  "cot_steps": {
+    "answer_only_final_step_filtered_count": 7473,
+    "answer_only_final_step_filtered_rate": 1.0,
+    "original_step_count_distribution": {
+      "count": 7473,
+      "max": 10,
+      "mean": 4.5755386056469955,
+      "p50": 4,
+      "p90": 7,
+      "p95": 7,
+      "p99": 9
+    },
+    "valid_step_count_distribution": {
+      "count": 7473,
+      "max": 9,
+      "mean": 3.5752709755118426,
+      "p50": 3,
+      "p90": 6,
+      "p95": 6,
+      "p99": 8
+    },
+    "valid_step_count_histogram": {
+      "2": 1962,
+      "3": 2149,
+      "4": 1658,
+      "5": 955,
+      "6": 419,
+      "7": 227,
+      "8": 90,
+      "9": 13
+    }
+  },
+  "data": {
+    "parsed_sample_count": 7473,
+    "preparse_skip_count": 0,
+    "preparse_skip_reason_counts": {},
+    "sample_total": 7473,
+    "source": "hf:openai/gsm8k:main:train",
+    "valid_question_count": 7473
+  },
+  "final_valid_reasoning_step_position": {
+    "original_step_index_distribution": {
+      "count": 7473,
+      "max": 8,
+      "mean": 2.5752709755118426,
+      "p50": 2,
+      "p90": 5,
+      "p95": 5,
+      "p99": 7
+    },
+    "original_step_index_histogram": {
+      "1": 1962,
+      "2": 2149,
+      "3": 1658,
+      "4": 955,
+      "5": 419,
+      "6": 227,
+      "7": 90,
+      "8": 13
+    },
+    "token_position_distribution": {
+      "count": 7473,
+      "max": 430,
+      "mean": 147.39930416164862,
+      "p50": 137,
+      "p90": 224,
+      "p95": 254,
+      "p99": 311
+    }
+  },
+  "latent": {
+    "batch_count": 468,
+    "batch_size": 16,
+    "latent_empty_batch_count": 0,
+    "latent_empty_batch_rate": 0.0,
+    "num_latent_steps": 4
+  },
+  "lengths": {
+    "student_input_tokens": {
+      "count": 7473,
+      "max": 220,
+      "mean": 62.2248093135287,
+      "p50": 58,
+      "p90": 90,
+      "p95": 102,
+      "p99": 128
+    },
+    "teacher_input_tokens": {
+      "count": 7473,
+      "max": 431,
+      "mean": 148.39930416164862,
+      "p50": 138,
+      "p90": 225,
+      "p95": 255,
+      "p99": 312
+    },
+    "teacher_over_configured_max_seq_len_count": 0,
+    "teacher_over_configured_max_seq_len_ids_first100": [],
+    "teacher_over_configured_max_seq_len_rate": 0.0
+  },
+  "oom_risk": {
+    "configured_batch_token_budget": 8192,
+    "max_observed_length": 431,
+    "reasons": [],
+    "risk_level": "low",
+    "teacher_over_1024_count": 0,
+    "teacher_over_512_count": 0,
+    "teacher_p99_length": 312
+  },
+  "recommendations": {
+    "configured_max_seq_len": 512,
+    "configured_max_seq_len_covers_full_data": true,
+    "no_truncation_max_seq_len": 448,
+    "practical_p99_max_seq_len": 320,
+    "recommended_batch_size": 16,
+    "recommended_max_seq_len": 448,
+    "token_budget_at_recommended_batch": 7168
+  },
+  "run": {
+    "created_at_utc": "2026-04-28T22:19:54.955614+00:00",
+    "name": "pr10_mvp_full_data_readiness",
+    "no_training": true,
+    "optimizer_step_executed": false,
+    "script": "lsp_jepa/scripts/scan_lsp_full_data.py"
+  },
+  "skips": {
+    "skip_reason_counts": {},
+    "skipped_sample_count": 0,
+    "skipped_sample_ids_first100": [],
+    "skipped_samples_first100": []
+  },
+  "teacher_target": {
+    "empty_teacher_target_count": 0,
+    "empty_teacher_target_rate": 0.0,
+    "empty_teacher_target_reason_counts": {},
+    "target_construction": {
+      "exclude_answer_prefix": true,
+      "exclude_answer_tokens": true,
+      "filter_answer_steps": true,
+      "target_pooling": "step_last_token"
+    }
+  }
+}

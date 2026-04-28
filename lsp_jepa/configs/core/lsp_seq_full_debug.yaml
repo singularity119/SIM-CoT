@@ -1,0 +1,81 @@
+experiment:
+  mode: core
+  host: simcot
+  backbone: lsp
+  use_lsp_jepa: true
+  run_kind: pr10_mvp_full_data_readiness_scan
+
+data:
+  dataset_source: gsm8k
+  dataset_id: openai/gsm8k
+  dataset_config: main
+  dataset_split: train
+  hf_endpoint: https://hf-mirror.com
+  expected_samples: 7473
+  data_path: null
+
+scan:
+  script: lsp_jepa/scripts/scan_lsp_full_data.py
+  output_path: lsp_jepa/runs/pr10_mvp/full_data_readiness_report.json
+  tokenizer_id: openai-community/gpt2
+  batch_size: 16
+  configured_max_seq_len: 512
+  max_skipped_ids: 100
+
+teacher:
+  ema_decay: 0.995
+  update_trainable_only: true
+  output_hidden_states: true
+  target_layer: last_2
+  target_pooling: step_last_token
+  target_space: projected_hidden
+  exclude_answer_tokens: true
+  exclude_answer_prefix: true
+  reasoning_step_filter: exclude_answer_only_steps
+
+student:
+  latent_arch: latent_tokens
+  num_latent_steps: 4
+  latent_dim: null
+  use_predictor_head: true
+  predictor_head_layers: 2
+  normalize_latents: true
+  detach_between_steps: false
+
+lsp_objective:
+  type: state
+  state_offset: 0
+  transition_weight: 0.0
+
+mapping:
+  strategy: sequence
+  sparse_positions: [first, middle, final]
+  attention_coverage_weight: 0.0
+
+loss:
+  alignment: normalized_mse
+  align_weight: 1.0
+  anti_collapse: none
+  anti_collapse_weight: 0.0
+  answer_readout_weight: 0.0
+
+host_losses:
+  host_answer_ce_weight: 0.0
+  codi_distill_weight: 0.0
+  simcot_decoder_weight: 0.0
+  intermediate_cot_ce_weight: 0.0
+
+logging:
+  log_latent_metrics: true
+  log_alignment_matrices: false
+  log_target_leakage_checks: true
+  log_host_losses: true
+
+optimization_contract:
+  no_training: true
+  no_backward: true
+  no_optimizer_step: true
+  no_ema_update: true
+  no_step_level_training: true
+  no_attention_or_soft_dtw: true
+  no_looped_student: true
