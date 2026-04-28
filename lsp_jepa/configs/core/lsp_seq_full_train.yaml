@@ -1,0 +1,109 @@
+experiment:
+  mode: core
+  host: simcot
+  backbone: coconut
+  use_lsp_jepa: true
+  run_kind: pr12_mvp_full_seq_train
+
+runtime:
+  model_id: tiny
+  device: auto
+  seed: 0
+
+data:
+  autodl_root: /root/autodl-tmp
+  cache_dir: /root/autodl-tmp/lsp_jepa/data
+  local_dataset_path: /root/autodl-tmp/lsp_jepa/data/gsm8k_train.jsonl
+  dataset_source: gsm8k
+  dataset_id: openai/gsm8k
+  dataset_config: main
+  dataset_split: train
+  hf_endpoint: https://hf-mirror.com
+  expected_samples: 7473
+  max_samples: null
+  data_path: null
+  max_teacher_length: 512
+  min_samples: 7473
+
+training:
+  script: lsp_jepa/scripts/train_lsp_jepa_core.py
+  output_dir: outputs/lsp_jepa/full_seq
+  metrics_path: outputs/lsp_jepa/full_seq/metrics.jsonl
+  summary_path: outputs/lsp_jepa/full_seq/summary.json
+  config_snapshot_path: outputs/lsp_jepa/full_seq/config.yaml
+  checkpoint_dir: outputs/lsp_jepa/full_seq/checkpoints
+  log_dir: outputs/lsp_jepa/full_seq/logs
+  save_checkpoints: true
+  max_steps: 468
+  one_epoch_steps: 468
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  gradient_clip_norm: 1.0
+  warmup_ratio: 0.03
+  save_every: 100
+  log_every: 10
+  lr: 0.00005
+  lr_note: Coconut GSM baseline lr is 1e-4; PR12 default is 0.5x.
+  weight_decay: 0.0
+  drop_last: false
+  shuffle: true
+
+teacher:
+  ema_decay: 0.995
+  update_trainable_only: true
+  output_hidden_states: true
+  target_layer: last_2
+  target_pooling: step_last_token
+  target_space: projected_hidden
+  target_position: final_valid_reasoning_step
+  exclude_answer_tokens: true
+  exclude_answer_prefix: true
+  reasoning_step_filter: exclude_answer_only_steps
+
+student:
+  latent_arch: latent_tokens
+  num_latent_steps: 4
+  latent_dim: null
+  use_predictor_head: true
+  predictor_head_layers: 2
+  normalize_latents: true
+  detach_between_steps: false
+
+lsp_objective:
+  objective: lsp_state
+  type: state
+  state_offset: 0
+  transition_weight: 0.0
+
+mapping:
+  strategy: sequence
+  sparse_positions: [first, middle, final]
+  attention_coverage_weight: 0.0
+
+loss:
+  alignment: normalized_mse
+  align_weight: 1.0
+  anti_collapse: variance
+  anti_collapse_weight: 0.01
+  answer_readout_weight: 0.0
+
+host_losses:
+  host_answer_ce_weight: 0.1
+  codi_distill_weight: 0.0
+  simcot_decoder_weight: 0.0
+  intermediate_cot_ce_weight: 0.0
+
+logging:
+  log_latent_metrics: true
+  log_alignment_matrices: false
+  log_target_leakage_checks: true
+  log_host_losses: true
+
+optimization_contract:
+  no_step_level_training: true
+  no_adapter_expansion: true
+  single_backward_per_batch: true
+  ema_update_after_optimizer_step: true
+  allow_empty_latents: false
+  allow_empty_teacher_targets: false
+  looped: false
