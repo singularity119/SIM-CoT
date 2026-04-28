@@ -11,6 +11,15 @@ DRY_RUN=0
 DEVICE=""
 MODEL_ID=""
 SAVE_EVERY=""
+SAVE_EVERY_EPOCH=0
+KEEP_LAST_CHECKPOINTS=""
+EVAL_EVERY=""
+EVAL_EVERY_EPOCH=0
+EVAL_OUTPUT_DIR=""
+EVAL_METRICS_PATH=""
+EVAL_JSON=""
+EVAL_SPLIT=""
+EVAL_LIMIT_SAMPLES=""
 EXTRA_ARGS=()
 
 usage() {
@@ -31,6 +40,15 @@ Options:
   --device DEVICE           Forward to train_lsp_jepa_core.py.
   --model-id ID             Forward to train_lsp_jepa_core.py.
   --save-every N            Forward checkpoint interval to train_lsp_jepa_core.py.
+  --save-every-epoch        Save checkpoints only at computed full-epoch boundaries.
+  --keep-last-checkpoints N Keep only the latest N step_*.pt checkpoints.
+  --eval-every N            Run final-answer eval every N training steps.
+  --eval-every-epoch        Run final-answer eval at computed full-epoch boundaries.
+  --eval-output-dir PATH    Eval output directory. Default: OUTPUT_DIR/evals.
+  --eval-metrics-path PATH  Eval JSONL metrics path.
+  --eval-json PATH          Eval JSON/JSONL file.
+  --eval-split SPLIT        Eval split when --eval-json is omitted. Default: test.
+  --eval-limit-samples N    Number of eval samples per eval run. Default trainer value: 20.
   -h, --help                Show this help.
 
 Examples:
@@ -76,6 +94,42 @@ while [[ $# -gt 0 ]]; do
       ;;
     --save-every)
       SAVE_EVERY="$2"
+      shift 2
+      ;;
+    --save-every-epoch)
+      SAVE_EVERY_EPOCH=1
+      shift
+      ;;
+    --keep-last-checkpoints)
+      KEEP_LAST_CHECKPOINTS="$2"
+      shift 2
+      ;;
+    --eval-every)
+      EVAL_EVERY="$2"
+      shift 2
+      ;;
+    --eval-every-epoch)
+      EVAL_EVERY_EPOCH=1
+      shift
+      ;;
+    --eval-output-dir)
+      EVAL_OUTPUT_DIR="$2"
+      shift 2
+      ;;
+    --eval-metrics-path)
+      EVAL_METRICS_PATH="$2"
+      shift 2
+      ;;
+    --eval-json)
+      EVAL_JSON="$2"
+      shift 2
+      ;;
+    --eval-split)
+      EVAL_SPLIT="$2"
+      shift 2
+      ;;
+    --eval-limit-samples)
+      EVAL_LIMIT_SAMPLES="$2"
       shift 2
       ;;
     -h|--help)
@@ -211,6 +265,33 @@ fi
 if [[ -n "$SAVE_EVERY" ]]; then
   CMD+=(--save-every "$SAVE_EVERY")
 fi
+if [[ "$SAVE_EVERY_EPOCH" == "1" ]]; then
+  CMD+=(--save-every-epoch)
+fi
+if [[ -n "$KEEP_LAST_CHECKPOINTS" ]]; then
+  CMD+=(--keep-last-checkpoints "$KEEP_LAST_CHECKPOINTS")
+fi
+if [[ -n "$EVAL_EVERY" ]]; then
+  CMD+=(--eval-every "$EVAL_EVERY")
+fi
+if [[ "$EVAL_EVERY_EPOCH" == "1" ]]; then
+  CMD+=(--eval-every-epoch)
+fi
+if [[ -n "$EVAL_OUTPUT_DIR" ]]; then
+  CMD+=(--eval-output-dir "$EVAL_OUTPUT_DIR")
+fi
+if [[ -n "$EVAL_METRICS_PATH" ]]; then
+  CMD+=(--eval-metrics-path "$EVAL_METRICS_PATH")
+fi
+if [[ -n "$EVAL_JSON" ]]; then
+  CMD+=(--eval-json "$EVAL_JSON")
+fi
+if [[ -n "$EVAL_SPLIT" ]]; then
+  CMD+=(--eval-split "$EVAL_SPLIT")
+fi
+if [[ -n "$EVAL_LIMIT_SAMPLES" ]]; then
+  CMD+=(--eval-limit-samples "$EVAL_LIMIT_SAMPLES")
+fi
 CMD+=("${EXTRA_ARGS[@]}")
 
 {
@@ -237,6 +318,14 @@ max_steps = int(row["max_steps"])
 width = 28
 filled = min(width, max(0, round(width * step / max_steps)))
 bar = "#" * filled + "." * (width - filled)
+eval_bits = ""
+eval_row = row.get("epoch_eval")
+if isinstance(eval_row, dict):
+    eval_bits = (
+        f" eval_acc={float(eval_row.get('accuracy', 0.0)):.4f}"
+        f" eval_em={float(eval_row.get('exact_match', 0.0)):.4f}"
+        f" invalid={float(eval_row.get('invalid_answer_rate', 0.0)):.4f}"
+    )
 print(
     f"progress [{bar}] {step}/{max_steps} "
     f"total_loss={float(row['total_loss']):.6f} "
@@ -244,6 +333,7 @@ print(
     f"host_answer_ce={float(row['host_answer_ce']):.6f} "
     f"latent_var={float(row['latent_variance_mean']):.6g} "
     f"ema_drift={float(row['ema_drift_l1']):.6g}"
+    f"{eval_bits}"
 )
 PY
   fi

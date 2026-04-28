@@ -70,3 +70,32 @@ lsp_jepa/scripts/launch_full_seq_train.sh --max-steps 1000
 ```
 
 Do not start this as an unattended background run until the operator confirms.
+
+## Long-Run Checkpoint And Eval Policy
+
+For SIM-CoT-scale long runs, save only epoch-boundary checkpoints and keep only
+the latest one. The trainer computes `epoch_steps` from the loaded training set,
+batch size, and `drop_last`, then uses the same boundary for final-answer eval.
+
+```bash
+CUDA_VISIBLE_DEVICES=0 lsp_jepa/scripts/launch_full_seq_train.sh \
+  --max-steps 16380 \
+  --run-name simcot_epoch35_gpt2 \
+  --model-id openai-community/gpt2 \
+  --device cuda \
+  --save-every-epoch \
+  --keep-last-checkpoints 1 \
+  --eval-every-epoch \
+  --eval-limit-samples 20 \
+  --output-root /root/autodl-tmp/lsp_jepa/runs/simcot_gpt2_lsp_core_epoch35
+```
+
+This writes the current epoch checkpoint under `checkpoints/`, deletes older
+`step_*.pt` files, and writes eval metrics under `evals/`:
+
+- `evals/metrics.jsonl`
+- `evals/latest.json`
+- `evals/step_XXXXXX.json`
+
+The eval path is final-answer only: no CoT generation, no teacher branch, no EMA
+update, no step-level objective, and no adapter expansion.

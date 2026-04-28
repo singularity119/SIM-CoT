@@ -310,11 +310,17 @@ def main() -> None:
         raise RuntimeError(
             f"need at least batch_size={args.batch_size} samples, found {len(samples)}"
         )
+    args.epoch_steps = steps_per_epoch(len(samples), args.batch_size, args.drop_last)
+    if args.save_every_epoch:
+        args.save_every = args.epoch_steps
+    if args.eval_every_epoch:
+        args.eval_every = args.epoch_steps
     train_loader = build_train_dataloader(samples, args)
     batch_iter = iter_train_batches(train_loader)
 
     tokenizer, base_model = build_tokenizer_and_model(args, samples)
     base_model.to(device)
+    epoch_eval_samples = load_epoch_eval_samples(args) if args.eval_every > 0 else []
 
     latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
     start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
@@ -349,10 +355,20 @@ def main() -> None:
     summary_path = resolve_metrics_path(args.summary_path)
     config_snapshot_path = resolve_metrics_path(args.config_snapshot_path)
     checkpoint_dir = resolve_metrics_path(args.checkpoint_dir)
+    eval_output_dir = resolve_metrics_path(args.eval_output_dir) if args.eval_output_dir else summary_path.parent / "evals"
+    eval_metrics_path = (
+        resolve_metrics_path(args.eval_metrics_path)
+        if args.eval_metrics_path
+        else eval_output_dir / "metrics.jsonl"
+    )
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     config_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if args.eval_every > 0:
+        eval_output_dir.mkdir(parents=True, exist_ok=True)
+        if eval_metrics_path.exists() and not args.append_metrics:
+            eval_metrics_path.unlink()
     if metrics_path.exists() and not args.append_metrics:
         metrics_path.unlink()
     write_config_snapshot(
@@ -498,6 +514,17 @@ def main() -> None:
             ema_teacher=ema_teacher,
             optimizer=optimizer,
         )
+        epoch_eval = maybe_run_epoch_eval(
+            args,
+            step=train_step,
+            student=student,
+            tokenizer=tokenizer,
+            eval_samples=epoch_eval_samples,
+            checkpoint_path=checkpoint_path,
+            eval_output_dir=eval_output_dir,
+            eval_metrics_path=eval_metrics_path,
+            device=device,
+        )
 
         metrics = {
             "step": train_step,
@@ -520,6 +547,9 @@ def main() -> None:
                 else None
             ),
             "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+            "checkpoint_keep_last": args.keep_last_checkpoints,
+            "epoch_steps": args.epoch_steps,
+            "epoch_index": epoch_index(train_step, args.epoch_steps),
             "unique_samples_seen": len(seen_sample_indices),
             "batch_size": args.batch_size,
             "batch_indices": batch_indices,
@@ -571,6 +601,15 @@ def main() -> None:
             "teacher_exclude_answer_tokens": not args.include_answer_tokens,
             "teacher_exclude_answer_prefix": not args.include_answer_prefix,
         }
+        if epoch_eval is not None:
+            metrics["epoch_eval"] = {
+                "metrics_path": epoch_eval["metrics_path"],
+                "step_metrics_path": epoch_eval["step_metrics_path"],
+                "accuracy": epoch_eval["accuracy"],
+                "exact_match": epoch_eval["exact_match"],
+                "invalid_answer_rate": epoch_eval["invalid_answer_rate"],
+                "num_eval_samples": epoch_eval["num_eval_samples"],
+            }
         append_metrics(metrics_path, metrics)
         metrics_history.append(metrics)
         if should_log_step(args, train_step):
@@ -663,6 +702,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--collapse-eps", type=float, default=1e-10)
     parser.add_argument("--pairwise-cosine-fail-threshold", type=float, default=0.999)
     parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument(
+        "--save-every-epoch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Override --save-every with the computed steps per full training epoch.",
+    )
+    parser.add_argument(
+        "--keep-last-checkpoints",
+        type=int,
+        default=0,
+        help="0 keeps all checkpoints; N keeps only the latest N step_*.pt files.",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=0,
+        help="Run final-answer eval every N training steps; 0 disables training-time eval.",
+    )
+    parser.add_argument(
+        "--eval-every-epoch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Override --eval-every with the computed steps per full training epoch.",
+    )
+    parser.add_argument("--eval-output-dir", default=None)
+    parser.add_argument("--eval-metrics-path", default=None)
+    parser.add_argument("--eval-json", type=Path)
+    parser.add_argument("--eval-split", default="test")
+    parser.add_argument("--eval-dataset-id", default="openai/gsm8k")
+    parser.add_argument("--eval-dataset-config", default="main")
+    parser.add_argument("--eval-expected-samples", type=int, default=1319)
+    parser.add_argument("--eval-limit-samples", type=int, default=20)
+    parser.add_argument("--eval-max-new-tokens", type=int, default=32)
+    parser.add_argument("--eval-save-examples", type=int, default=5)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--drop-last", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
@@ -718,6 +791,20 @@ def apply_config(
     set_from_config(args, provided_flags, "max_steps", config_get(config, "training.max_steps"))
     set_from_config(args, provided_flags, "batch_size", config_get(config, "training.batch_size"))
     set_from_config(args, provided_flags, "save_every", config_get(config, "training.save_every"))
+    set_from_config(args, provided_flags, "save_every_epoch", config_get(config, "training.save_every_epoch"))
+    set_from_config(args, provided_flags, "keep_last_checkpoints", config_get(config, "training.keep_last_checkpoints"))
+    set_from_config(args, provided_flags, "eval_every", config_get(config, "eval.every_steps"))
+    set_from_config(args, provided_flags, "eval_every_epoch", config_get(config, "eval.every_epoch"))
+    set_from_config(args, provided_flags, "eval_output_dir", config_get(config, "eval.output_dir"))
+    set_from_config(args, provided_flags, "eval_metrics_path", config_get(config, "eval.metrics_path"))
+    set_from_config(args, provided_flags, "eval_json", config_get(config, "eval.eval_json"), path=True)
+    set_from_config(args, provided_flags, "eval_split", config_get(config, "eval.eval_split"))
+    set_from_config(args, provided_flags, "eval_dataset_id", config_get(config, "eval.dataset_id"))
+    set_from_config(args, provided_flags, "eval_dataset_config", config_get(config, "eval.dataset_config"))
+    set_from_config(args, provided_flags, "eval_expected_samples", config_get(config, "eval.expected_samples"))
+    set_from_config(args, provided_flags, "eval_limit_samples", config_get(config, "eval.limit_samples"))
+    set_from_config(args, provided_flags, "eval_max_new_tokens", config_get(config, "eval.max_new_tokens"))
+    set_from_config(args, provided_flags, "eval_save_examples", config_get(config, "eval.save_examples"))
     set_from_config(args, provided_flags, "log_every", config_get(config, "training.log_every"))
     set_from_config(args, provided_flags, "lr", config_get(config, "training.lr"))
     set_from_config(args, provided_flags, "weight_decay", config_get(config, "training.weight_decay"))
@@ -1274,6 +1361,20 @@ def iter_train_batches(
             yield batch
 
 
+def steps_per_epoch(sample_count: int, batch_size: int, drop_last: bool) -> int:
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    if drop_last:
+        return max(1, sample_count // batch_size)
+    return max(1, math.ceil(sample_count / batch_size))
+
+
+def epoch_index(step: int, epoch_steps: int) -> int:
+    if epoch_steps < 1:
+        return 0
+    return math.ceil(step / epoch_steps)
+
+
 def should_log_step(args: argparse.Namespace, step: int) -> bool:
     return step == 1 or step == args.max_steps or (args.log_every > 0 and step % args.log_every == 0)
 
@@ -1323,7 +1424,237 @@ def maybe_save_checkpoint(
         },
         path,
     )
+    prune_old_checkpoints(checkpoint_dir, keep_last=args.keep_last_checkpoints)
     return path
+
+
+def prune_old_checkpoints(checkpoint_dir: Path, *, keep_last: int) -> None:
+    if keep_last <= 0:
+        return
+    checkpoints = sorted(
+        checkpoint_dir.glob("step_*.pt"),
+        key=lambda path: (checkpoint_step_number(path), path.name),
+    )
+    for old_path in checkpoints[:-keep_last]:
+        old_path.unlink(missing_ok=True)
+
+
+def checkpoint_step_number(path: Path) -> int:
+    match = re.match(r"step_(\d+)\.pt$", path.name)
+    return int(match.group(1)) if match else -1
+
+
+def load_epoch_eval_samples(args: argparse.Namespace) -> list[Sample]:
+    limit = None if args.eval_limit_samples is None or args.eval_limit_samples <= 0 else int(args.eval_limit_samples)
+    if args.eval_json is not None:
+        return load_samples_from_path(resolve_repo_path(args.eval_json), limit=limit)
+    return load_hf_dataset_samples(
+        dataset_id=args.eval_dataset_id,
+        config=args.eval_dataset_config,
+        split=args.eval_split,
+        limit=limit,
+        expected_samples=args.eval_expected_samples,
+        hf_endpoint=args.hf_endpoint,
+    )
+
+
+def maybe_run_epoch_eval(
+    args: argparse.Namespace,
+    *,
+    step: int,
+    student: nn.Module,
+    tokenizer: Any,
+    eval_samples: Sequence[Sample],
+    checkpoint_path: Path | None,
+    eval_output_dir: Path,
+    eval_metrics_path: Path,
+    device: torch.device,
+) -> dict[str, Any] | None:
+    if args.eval_every <= 0:
+        return None
+    if step != args.max_steps and step % args.eval_every != 0:
+        return None
+    if not eval_samples:
+        raise RuntimeError("eval_every is enabled but no eval samples were loaded")
+
+    was_training = student.training
+    student.eval()
+    rows = []
+    exact_matches = 0
+    numeric_matches = 0
+    invalid_answers = 0
+    generated_lengths = []
+    with torch.no_grad():
+        for index, sample in enumerate(eval_samples):
+            input_ids = build_final_answer_eval_input_ids(
+                tokenizer,
+                sample.question,
+                num_latent_steps=args.num_latent_steps,
+                device=device,
+            )
+            outputs = student.generate(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids, device=device),
+                max_new_tokens=args.eval_max_new_tokens,
+                synced_gpus=False,
+            )
+            generated_ids = outputs[0, input_ids.shape[1] :].detach().cpu().tolist()
+            generated_ids = trim_after_eos(generated_ids, int(tokenizer.eos_token_id))
+            generated_text = decode_token_ids(tokenizer, generated_ids)
+            normalized_prediction = normalize_baseline_answer(generated_text)
+            normalized_gold = normalize_baseline_answer(sample.answer)
+            prediction_number = extract_last_number(normalized_prediction)
+            gold_number = extract_last_number(normalized_gold)
+            exact = normalized_prediction == normalized_gold
+            numeric = (
+                prediction_number is not None
+                and gold_number is not None
+                and prediction_number == gold_number
+            )
+            invalid = prediction_number is None
+            exact_matches += int(exact)
+            numeric_matches += int(numeric)
+            invalid_answers += int(invalid)
+            generated_lengths.append(len(generated_ids))
+            rows.append(
+                {
+                    "index": index,
+                    "sample_id": sample.sample_id,
+                    "source": sample.source,
+                    "gold": normalized_gold,
+                    "prediction": normalized_prediction,
+                    "generated_text": generated_text,
+                    "generated_length": len(generated_ids),
+                    "exact_match": exact,
+                    "accuracy_match": numeric,
+                    "invalid_answer": invalid,
+                }
+            )
+    if was_training:
+        student.train()
+    else:
+        student.eval()
+
+    total = len(eval_samples)
+    step_metrics_path = eval_output_dir / f"step_{step:06d}.json"
+    metrics = {
+        "step": step,
+        "epoch_index": epoch_index(step, args.epoch_steps),
+        "epoch_steps": args.epoch_steps,
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+        "accuracy": safe_div(numeric_matches, total),
+        "exact_match": safe_div(exact_matches, total),
+        "invalid_answer_rate": safe_div(invalid_answers, total),
+        "generated_length": {
+            "mean": mean(generated_lengths),
+            "min": min(generated_lengths) if generated_lengths else 0,
+            "max": max(generated_lengths) if generated_lengths else 0,
+        },
+        "generated_length_mean": mean(generated_lengths),
+        "num_eval_samples": total,
+        "limit_eval_samples": args.eval_limit_samples,
+        "eval_json": str(resolve_repo_path(args.eval_json)) if args.eval_json else None,
+        "eval_split": args.eval_split,
+        "dataset_id": args.eval_dataset_id,
+        "dataset_config": args.eval_dataset_config,
+        "answer_normalization": "Coconut baseline: split on '#', remove commas, strip whitespace",
+        "generation": {
+            "generate_cot": False,
+            "final_answer_only": True,
+            "max_new_tokens": args.eval_max_new_tokens,
+            "greedy": True,
+        },
+        "core_eval_contract": {
+            "no_teacher_branch": True,
+            "ema_updated": False,
+            "step_level_eval": False,
+            "adapter_expansion": False,
+        },
+        "examples": rows[: args.eval_save_examples],
+        "metrics_path": str(eval_metrics_path),
+        "step_metrics_path": str(step_metrics_path),
+    }
+    write_json(step_metrics_path, metrics)
+    write_json(eval_output_dir / "latest.json", metrics)
+    append_metrics(eval_metrics_path, metrics)
+    print(json.dumps({"epoch_eval": compact_eval_metrics(metrics)}, sort_keys=True))
+    return metrics
+
+
+def compact_eval_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "step": metrics["step"],
+        "epoch_index": metrics["epoch_index"],
+        "checkpoint_path": metrics["checkpoint_path"],
+        "accuracy": metrics["accuracy"],
+        "exact_match": metrics["exact_match"],
+        "invalid_answer_rate": metrics["invalid_answer_rate"],
+        "num_eval_samples": metrics["num_eval_samples"],
+        "step_metrics_path": metrics["step_metrics_path"],
+    }
+
+
+def build_final_answer_eval_input_ids(
+    tokenizer: Any,
+    question: str,
+    *,
+    num_latent_steps: int,
+    device: torch.device,
+) -> torch.Tensor:
+    start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
+    latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
+    end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
+    token_ids = (
+        list(tokenizer.encode(question + "\n", add_special_tokens=True))
+        + [start_id]
+        + [latent_id] * num_latent_steps
+        + [end_id]
+    )
+    return torch.tensor([token_ids], dtype=torch.long, device=device)
+
+
+def trim_after_eos(token_ids: list[int], eos_token_id: int) -> list[int]:
+    if eos_token_id in token_ids:
+        return token_ids[: token_ids.index(eos_token_id)]
+    return token_ids
+
+
+def decode_token_ids(tokenizer: Any, token_ids: Sequence[int]) -> str:
+    if not isinstance(tokenizer, MinimalTokenizer) and hasattr(tokenizer, "decode"):
+        return tokenizer.decode(token_ids, skip_special_tokens=True).strip()
+    tokens = []
+    for token_id in token_ids:
+        if token_id in (tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id):
+            continue
+        tokens.append(tokenizer._id_to_token.get(int(token_id), f"<unk:{int(token_id)}>"))
+    return " ".join(tokens).strip()
+
+
+def normalize_baseline_answer(text: Any) -> str:
+    return str(text).split("#")[-1].replace(",", "").strip()
+
+
+def extract_last_number(text: str) -> str | None:
+    text = re.sub(r"<unk:\d+>", " ", text)
+    matches = re.findall(r"-?\d+(?:\.\d+)?", text.replace(",", ""))
+    if not matches:
+        return None
+    value = matches[-1]
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+    if math.isfinite(number) and number.is_integer():
+        return str(int(number))
+    return str(number)
+
+
+def safe_div(numerator: int, denominator: int) -> float:
+    return float(numerator / denominator) if denominator else 0.0
+
+
+def mean(values: Sequence[int]) -> float:
+    return float(sum(values) / len(values)) if values else 0.0
 
 
 def batch_indices_for_step(
@@ -1455,7 +1786,10 @@ def build_config_snapshot(
             "max_steps": args.max_steps,
             "supported_max_steps": [100, 500],
             "batch_size": args.batch_size,
+            "epoch_steps": args.epoch_steps,
             "save_every": args.save_every,
+            "save_every_epoch": args.save_every_epoch,
+            "keep_last_checkpoints": args.keep_last_checkpoints,
             "log_every": args.log_every,
             "save_checkpoints": args.save_checkpoints,
             "single_backward_per_batch": True,
@@ -1488,6 +1822,22 @@ def build_config_snapshot(
             "model_id": args.model_id,
             "device": str(device),
             "seed": args.seed,
+        },
+        "eval": {
+            "every_steps": args.eval_every,
+            "every_epoch": args.eval_every_epoch,
+            "output_dir": args.eval_output_dir,
+            "metrics_path": args.eval_metrics_path,
+            "eval_json": str(args.eval_json) if args.eval_json else None,
+            "eval_split": args.eval_split,
+            "dataset_id": args.eval_dataset_id,
+            "dataset_config": args.eval_dataset_config,
+            "expected_samples": args.eval_expected_samples,
+            "limit_samples": args.eval_limit_samples,
+            "max_new_tokens": args.eval_max_new_tokens,
+            "save_examples": args.eval_save_examples,
+            "final_answer_only": True,
+            "generate_cot": False,
         },
         "logging": {
             "log_latent_metrics": True,
@@ -1604,6 +1954,8 @@ def build_summary(
             ),
             "checkpoint_dir": str(resolve_metrics_path(args.checkpoint_dir)),
             "last_checkpoint_path": last.get("checkpoint_path"),
+            "checkpoint_keep_last": args.keep_last_checkpoints,
+            "epoch_steps": args.epoch_steps,
         },
         "loss_curve": {
             "first_total_loss": float(first["total_loss"]),
@@ -1646,6 +1998,11 @@ def build_summary(
             "teacher_exclude_answer_tokens": bool(last["teacher_exclude_answer_tokens"]),
             "teacher_exclude_answer_prefix": bool(last["teacher_exclude_answer_prefix"]),
             "answer_leakage_ok": answer_leakage_ok,
+        },
+        "epoch_eval": {
+            "enabled": args.eval_every > 0,
+            "every_steps": args.eval_every,
+            "latest": last.get("epoch_eval"),
         },
         "acceptance": acceptance,
     }
