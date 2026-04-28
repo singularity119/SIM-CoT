@@ -5,6 +5,8 @@ import torch
 
 from lsp_jepa.train_lsp_coconut_minimal import (
     Sample,
+    batch_indices_for_step,
+    default_samples,
     final_valid_step_position,
     sample_from_record,
     validate_no_answer_leakage,
@@ -64,3 +66,16 @@ def test_answer_leakage_check_rejects_answer_markers() -> None:
             include_answer_tokens=False,
             include_answer_prefix=False,
         )
+
+
+def test_synthetic_source_can_generate_pr9_sample_count() -> None:
+    samples = default_samples(128)
+
+    assert len(samples) == 128
+    assert len({sample.source for sample in samples}) == 128
+    assert all(sample.question and sample.cot_steps and sample.answer for sample in samples)
+
+
+def test_batch_indices_cycle_through_samples() -> None:
+    assert batch_indices_for_step(sample_count=10, batch_size=4, step=1) == [0, 1, 2, 3]
+    assert batch_indices_for_step(sample_count=10, batch_size=4, step=3) == [8, 9, 0, 1]

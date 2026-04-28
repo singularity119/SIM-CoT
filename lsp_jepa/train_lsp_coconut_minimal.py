@@ -1,9 +1,10 @@
-"""Minimal sequence-level LSP-JEPA smoke training closure on Coconut.
+"""Minimal sequence-level LSP-JEPA debug training closure on Coconut.
 
 This script is intentionally small: one student forward, one EMA-teacher target
 forward, one scalar sequence-level alignment loss, optional host answer CE, one
-backward/optimizer step, one EMA update, and JSONL metrics. It supports tiny
-real GSM8K/GSM8K-Aug style samples without adding step-level objectives,
+backward/optimizer step, one EMA update, JSONL metrics, and a compact summary.
+It supports tiny real GSM8K/GSM8K-Aug style samples and an offline synthetic
+GSM8K-style source for PR9-MVP runs without adding step-level objectives,
 adapter expansion, distributed training, wandb, or checkpoint management.
 """
 
@@ -56,7 +57,12 @@ from lsp_jepa.adapters.coconut_lsp_adapter import CoconutLSPAdapter  # noqa: E40
 from lsp_jepa.core.ema_teacher import EMATeacher  # noqa: E402
 from lsp_jepa.core.latent_interface import TeacherTargetBatch  # noqa: E402
 from lsp_jepa.core.losses import compute_lsp_state_loss  # noqa: E402
-from lsp_jepa.core.metrics import per_dim_variance  # noqa: E402
+from lsp_jepa.core.metrics import (  # noqa: E402
+    effective_rank,
+    pairwise_cosine,
+    pairwise_l2,
+    per_dim_variance,
+)
 from lsp_jepa.core.target_builder import (  # noqa: E402
     build_teacher_inputs,
     gather_step_boundary_hidden_states,
@@ -241,20 +247,30 @@ class TinyCausalLM(nn.Module):
 def main() -> None:
     args = parse_args()
     if args.objective != "sequence":
-        raise ValueError("PR8-MVP only supports objective=sequence")
+        raise ValueError("PR9-MVP only supports objective=sequence")
     if args.max_steps < 1:
         raise ValueError("--max-steps must be at least 1")
     if args.num_latent_steps < 1:
         raise ValueError("--num-latent-steps must be at least 1")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if args.num_samples < 1:
+        raise ValueError("--num-samples must be at least 1")
+    if args.min_samples < 1:
+        raise ValueError("--min-samples must be at least 1")
 
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
     samples = load_samples(args)
+    if len(samples) < args.min_samples:
+        raise RuntimeError(
+            f"need at least min_samples={args.min_samples} usable samples, "
+            f"found {len(samples)}"
+        )
     if len(samples) < args.batch_size:
         raise RuntimeError(
             f"need at least batch_size={args.batch_size} samples, found {len(samples)}"
         )
-    samples = samples[: args.batch_size]
 
     tokenizer, base_model = build_tokenizer_and_model(args, samples)
     base_model.to(device)
@@ -284,29 +300,54 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
     metrics_path = resolve_metrics_path(args.metrics_path)
+    summary_path = resolve_metrics_path(args.summary_path)
+    config_snapshot_path = resolve_metrics_path(args.config_snapshot_path)
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    config_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
     if metrics_path.exists() and not args.append_metrics:
         metrics_path.unlink()
+    write_config_snapshot(
+        config_snapshot_path,
+        build_config_snapshot(
+            args,
+            device=device,
+            sample_count=len(samples),
+            metrics_path=metrics_path,
+            summary_path=summary_path,
+            config_snapshot_path=config_snapshot_path,
+        ),
+    )
 
-    student_batch = build_student_batch(
-        tokenizer,
-        samples,
-        latent_id=latent_id,
-        start_id=start_id,
-        end_id=end_id,
-        num_latent_steps=args.num_latent_steps,
-        device=device,
-    )
-    teacher_inputs = build_teacher_batch(tokenizer, samples, args, device)
-    answer_leakage_ok = validate_no_answer_leakage(
-        samples,
-        teacher_inputs,
-        include_answer_tokens=args.include_answer_tokens,
-        include_answer_prefix=args.include_answer_prefix,
-    )
     adapter = CoconutLSPAdapter(latent_token_id=latent_id)
+    metrics_history: list[dict[str, Any]] = []
+    seen_sample_indices: set[int] = set()
 
     for train_step in range(1, args.max_steps + 1):
+        batch_indices = batch_indices_for_step(
+            sample_count=len(samples),
+            batch_size=args.batch_size,
+            step=train_step,
+        )
+        seen_sample_indices.update(batch_indices)
+        batch_samples = [samples[index] for index in batch_indices]
+        student_batch = build_student_batch(
+            tokenizer,
+            batch_samples,
+            latent_id=latent_id,
+            start_id=start_id,
+            end_id=end_id,
+            num_latent_steps=args.num_latent_steps,
+            device=device,
+        )
+        teacher_inputs = build_teacher_batch(tokenizer, batch_samples, args, device)
+        answer_leakage_ok = validate_no_answer_leakage(
+            batch_samples,
+            teacher_inputs,
+            include_answer_tokens=args.include_answer_tokens,
+            include_answer_prefix=args.include_answer_prefix,
+        )
+
         teacher_output = ema_teacher(
             input_ids=teacher_inputs["teacher_input_ids"],
             attention_mask=teacher_inputs["attention_mask"],
@@ -355,14 +396,24 @@ def main() -> None:
         if host_answer_ce is None:
             raise RuntimeError("Coconut host output did not provide host_answer_ce")
         total_loss = args.lsp_weight * lsp_loss + args.host_answer_ce_weight * host_answer_ce
-        latent_variance = per_dim_variance(h_final, final_mask)["mean"]
+        latent_variance = per_dim_variance(h_final, final_mask)
+        pairwise = pairwise_cosine_summary(h_final, final_mask)
+        pairwise_l2_mean = pairwise_l2(h_final, final_mask)
+        latent_effective_rank = effective_rank(h_final, final_mask)
+        answer_ce_terms = answer_ce_terms_in_total(args, host_answer_ce)
+        answer_ce_double_count_ok = len(answer_ce_terms) <= 1
 
         validate_finite("total_loss", total_loss)
         validate_finite("lsp_loss", lsp_loss)
         validate_finite("host_answer_ce", host_answer_ce)
-        validate_finite("latent_variance", latent_variance)
+        validate_finite("latent_variance_mean", latent_variance["mean"])
+        validate_finite("pairwise_cosine_mean", pairwise["mean"])
+        validate_finite("pairwise_l2_mean", pairwise_l2_mean)
+        validate_finite("effective_rank", latent_effective_rank)
         if not bool(final_mask.any().detach().cpu().item()):
             raise RuntimeError("no valid final sequence alignment targets were found")
+        if not answer_ce_double_count_ok:
+            raise RuntimeError("answer CE would be counted more than once in total loss")
 
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
@@ -382,13 +433,29 @@ def main() -> None:
         metrics = {
             "step": train_step,
             "max_steps": args.max_steps,
+            "sample_count": len(samples),
+            "unique_samples_seen": len(seen_sample_indices),
+            "batch_size": args.batch_size,
+            "batch_indices": batch_indices,
             "data_source": args.dataset_source if args.data_path is None else str(args.data_path),
-            "sample_sources": [sample.source for sample in samples],
+            "batch_sample_sources": [sample.source for sample in batch_samples],
             "total_loss": to_float(total_loss),
             "lsp_loss": to_float(lsp_loss),
             "host_answer_ce": to_float(host_answer_ce),
             "host_answer_ce_weight": args.host_answer_ce_weight,
-            "latent_variance": to_float(latent_variance),
+            "answer_ce_terms_in_total": answer_ce_terms,
+            "answer_ce_double_count_ok": answer_ce_double_count_ok,
+            "latent_variance": to_float(latent_variance["mean"]),
+            "latent_variance_mean": to_float(latent_variance["mean"]),
+            "latent_variance_min": to_float(latent_variance["min"]),
+            "latent_variance_max": to_float(latent_variance["max"]),
+            "effective_rank": to_float(latent_effective_rank),
+            "pairwise_cosine": to_float(pairwise["mean"]),
+            "pairwise_cosine_mean": to_float(pairwise["mean"]),
+            "pairwise_cosine_min": to_float(pairwise["min"]),
+            "pairwise_cosine_max": to_float(pairwise["max"]),
+            "pairwise_cosine_all_one": pairwise["all_one"],
+            "pairwise_l2_mean": to_float(pairwise_l2_mean),
             "student_grad_l1": student_grad_l1,
             "teacher_grad_params": sum(
                 param.grad is not None for param in ema_teacher.parameters()
@@ -407,38 +474,69 @@ def main() -> None:
             "answer_leakage_ok": answer_leakage_ok,
         }
         append_metrics(metrics_path, metrics)
+        metrics_history.append(metrics)
         print(json.dumps(metrics, sort_keys=True))
 
-    print(json.dumps({"metrics_path": str(metrics_path), "completed_steps": args.max_steps}))
+    summary = build_summary(
+        metrics_history,
+        args=args,
+        sample_count=len(samples),
+        unique_samples_seen=len(seen_sample_indices),
+        metrics_path=metrics_path,
+        summary_path=summary_path,
+        config_snapshot_path=config_snapshot_path,
+    )
+    write_json(summary_path, summary)
+    print(
+        json.dumps(
+            {
+                "metrics_path": str(metrics_path),
+                "summary_path": str(summary_path),
+                "config_snapshot_path": str(config_snapshot_path),
+                "completed_steps": args.max_steps,
+                "unique_samples_seen": len(seen_sample_indices),
+                "acceptance_passed": summary["acceptance"]["passed"],
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-id", default="tiny", help="'tiny' or a local/HF model id")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
-    parser.add_argument("--max-steps", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--max-steps", type=int, default=16)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--objective", default="sequence")
     parser.add_argument("--lsp-weight", type=float, default=1.0)
-    parser.add_argument("--host-answer-ce-weight", type=float, default=0.1)
+    parser.add_argument("--host-answer-ce-weight", type=float, default=0.05)
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--target-layer", default="last_2")
     parser.add_argument("--num-latent-steps", type=int, default=2)
     parser.add_argument("--max-teacher-length", type=int, default=256)
-    parser.add_argument("--metrics-path", default="lsp_jepa/runs/pr8_mvp/metrics.jsonl")
+    parser.add_argument("--metrics-path", default="lsp_jepa/runs/pr9_mvp/metrics.jsonl")
+    parser.add_argument("--summary-path", default="lsp_jepa/runs/pr9_mvp/summary.json")
+    parser.add_argument(
+        "--config-snapshot-path",
+        default="lsp_jepa/runs/pr9_mvp/config_snapshot.yaml",
+    )
     parser.add_argument("--append-metrics", action="store_true")
     parser.add_argument("--data-path", type=Path)
     parser.add_argument(
         "--dataset-source",
-        default="gsm8k_smoke",
+        default="synthetic",
         choices=("gsm8k_smoke", "gsm8k", "gsm8k_aug", "synthetic"),
     )
     parser.add_argument("--dataset-split", default="train")
     parser.add_argument("--dataset-config", default="main")
-    parser.add_argument("--num-samples", type=int, default=8)
+    parser.add_argument("--num-samples", type=int, default=128)
+    parser.add_argument("--min-samples", type=int, default=1)
+    parser.add_argument("--loss-stability-ratio", type=float, default=1.05)
+    parser.add_argument("--collapse-eps", type=float, default=1e-10)
     parser.add_argument("--include-answer-tokens", action="store_true")
     parser.add_argument("--include-answer-prefix", action="store_true")
     parser.add_argument(
@@ -457,8 +555,10 @@ def resolve_device(requested: str) -> torch.device:
     return torch.device(requested)
 
 
-def default_samples() -> list[Sample]:
-    return [
+def default_samples(limit: int = 2) -> list[Sample]:
+    """Generate deterministic GSM8K-style samples for offline debug training."""
+
+    samples = [
         Sample(
             question="What is two plus three?",
             cot_steps=[
@@ -467,7 +567,7 @@ def default_samples() -> list[Sample]:
                 "#### 5",
             ],
             answer="5",
-            source="synthetic",
+            source="synthetic:0",
         ),
         Sample(
             question="A box has four red pens and three blue pens. How many pens?",
@@ -477,16 +577,84 @@ def default_samples() -> list[Sample]:
                 "The answer is 7",
             ],
             answer="7",
-            source="synthetic",
+            source="synthetic:1",
         ),
     ]
+    for index in range(len(samples), max(limit, len(samples))):
+        samples.append(synthetic_arithmetic_sample(index))
+    return samples[:limit]
+
+
+def synthetic_arithmetic_sample(index: int) -> Sample:
+    pattern = index % 4
+    a = 2 + (index * 3) % 37
+    b = 3 + (index * 5) % 29
+    c = 1 + (index * 7) % 17
+    if pattern == 0:
+        answer = a + b + c
+        return Sample(
+            question=(
+                f"A shelf has {a} red books, {b} blue books, and {c} green books. "
+                "How many books are on the shelf?"
+            ),
+            cot_steps=[
+                f"Start with {a} red books.",
+                f"Add {b} blue books to get {a + b} books.",
+                f"Add {c} green books to get {answer} books.",
+            ],
+            answer=str(answer),
+            source=f"synthetic:{index}",
+        )
+    if pattern == 1:
+        answer = a * b
+        return Sample(
+            question=f"There are {a} boxes with {b} markers in each box. How many markers?",
+            cot_steps=[
+                f"Each box has {b} markers.",
+                f"With {a} boxes, multiply {a} by {b}.",
+                f"The product is {answer} markers.",
+            ],
+            answer=str(answer),
+            source=f"synthetic:{index}",
+        )
+    if pattern == 2:
+        start = a + b + c
+        answer = start - b
+        return Sample(
+            question=(
+                f"Mia collected {start} stickers and gave {b} stickers away. "
+                "How many stickers remain?"
+            ),
+            cot_steps=[
+                f"Mia starts with {start} stickers.",
+                f"She gives away {b} stickers.",
+                f"Subtracting leaves {answer} stickers.",
+            ],
+            answer=str(answer),
+            source=f"synthetic:{index}",
+        )
+    unit = 2 + (index % 9)
+    answer = a * unit + c
+    return Sample(
+        question=(
+            f"Noah buys {a} packs with {unit} pencils each and then finds {c} more. "
+            "How many pencils does Noah have?"
+        ),
+        cot_steps=[
+            f"The packs contain {a} times {unit} pencils.",
+            f"That gives {a * unit} pencils from packs.",
+            f"Adding {c} more gives {answer} pencils.",
+        ],
+        answer=str(answer),
+        source=f"synthetic:{index}",
+    )
 
 
 def load_samples(args: argparse.Namespace) -> list[Sample]:
     if args.data_path is not None:
         return load_samples_from_path(args.data_path, limit=args.num_samples)
     if args.dataset_source == "synthetic":
-        return default_samples()[: args.num_samples]
+        return default_samples(args.num_samples)
     if args.dataset_source == "gsm8k_smoke":
         return load_samples_from_path(
             REPO_ROOT / "lsp_jepa" / "data" / "gsm8k_smoke.jsonl",
@@ -700,6 +868,310 @@ def resolve_repo_path(path: Path) -> Path:
 def resolve_metrics_path(path_text: str) -> Path:
     path = Path(path_text)
     return path if path.is_absolute() else REPO_ROOT / path
+
+
+def batch_indices_for_step(
+    *,
+    sample_count: int,
+    batch_size: int,
+    step: int,
+) -> list[int]:
+    if sample_count < 1:
+        raise ValueError("sample_count must be positive")
+    start = ((step - 1) * batch_size) % sample_count
+    return [(start + offset) % sample_count for offset in range(batch_size)]
+
+
+def pairwise_cosine_summary(
+    states: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict[str, torch.Tensor | bool]:
+    matrix = pairwise_cosine(states, mask, reduction="none")
+    mean = pairwise_cosine(states, mask)
+    if matrix.shape[0] < 2:
+        zero = states.sum() * 0.0
+        return {"mean": mean, "min": zero, "max": zero, "all_one": False}
+    eye = torch.eye(matrix.shape[0], device=matrix.device, dtype=torch.bool)
+    values = matrix[~eye]
+    if values.numel() == 0:
+        zero = states.sum() * 0.0
+        return {"mean": mean, "min": zero, "max": zero, "all_one": False}
+    return {
+        "mean": mean,
+        "min": values.min(),
+        "max": values.max(),
+        "all_one": bool(
+            torch.allclose(
+                values.detach(),
+                torch.ones_like(values),
+                rtol=1e-5,
+                atol=1e-6,
+            )
+        ),
+    }
+
+
+def configured_answer_ce_terms(args: argparse.Namespace) -> list[str]:
+    terms = []
+    if args.host_answer_ce_weight != 0.0:
+        terms.append("host_answer_ce")
+    return terms
+
+
+def answer_ce_terms_in_total(
+    args: argparse.Namespace,
+    host_answer_ce: torch.Tensor | None,
+) -> list[str]:
+    if host_answer_ce is None:
+        return []
+    return configured_answer_ce_terms(args)
+
+
+def build_config_snapshot(
+    args: argparse.Namespace,
+    *,
+    device: torch.device,
+    sample_count: int,
+    metrics_path: Path,
+    summary_path: Path,
+    config_snapshot_path: Path,
+) -> dict[str, Any]:
+    data_source = args.dataset_source if args.data_path is None else str(args.data_path)
+    answer_ce_terms = configured_answer_ce_terms(args)
+    return {
+        "experiment": {
+            "mode": "core",
+            "host": "simcot",
+            "backbone": "lsp",
+            "use_lsp_jepa": True,
+            "run_kind": "PR9-MVP sequence-level debug train",
+        },
+        "teacher": {
+            "ema_decay": args.ema_decay,
+            "update_trainable_only": True,
+            "output_hidden_states": True,
+            "target_layer": args.target_layer,
+            "target_pooling": "step_last_token",
+            "target_space": "raw_hidden",
+            "exclude_answer_tokens": not args.include_answer_tokens,
+            "exclude_answer_prefix": not args.include_answer_prefix,
+            "reasoning_step_filter": args.reasoning_step_filter,
+        },
+        "student": {
+            "latent_arch": "latent_tokens",
+            "num_latent_steps": args.num_latent_steps,
+            "latent_dim": None,
+            "use_predictor_head": False,
+            "predictor_head_layers": 0,
+            "normalize_latents": True,
+            "detach_between_steps": False,
+        },
+        "lsp_objective": {
+            "type": "state",
+            "state_offset": 0,
+            "transition_weight": 0.0,
+        },
+        "mapping": {
+            "strategy": "sequence",
+            "sparse_positions": ["first", "middle", "final"],
+            "attention_coverage_weight": 0.0,
+        },
+        "loss": {
+            "alignment": "normalized_mse",
+            "align_weight": args.lsp_weight,
+            "anti_collapse": "none",
+            "anti_collapse_weight": 0.0,
+            "answer_readout_weight": 0.0,
+        },
+        "host_losses": {
+            "host_answer_ce_weight": args.host_answer_ce_weight,
+            "codi_distill_weight": 0.0,
+            "simcot_decoder_weight": 0.0,
+            "intermediate_cot_ce_weight": 0.0,
+            "answer_ce_terms_in_total": answer_ce_terms,
+            "answer_ce_double_count_ok": len(answer_ce_terms) <= 1,
+        },
+        "optimization": {
+            "optimizer": "AdamW",
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "max_steps": args.max_steps,
+            "batch_size": args.batch_size,
+            "single_backward_per_batch": True,
+            "ema_update_after_optimizer_step": True,
+        },
+        "data": {
+            "source": data_source,
+            "dataset_split": args.dataset_split,
+            "dataset_config": args.dataset_config,
+            "num_samples_requested": args.num_samples,
+            "num_samples_loaded": sample_count,
+            "min_samples": args.min_samples,
+            "max_teacher_length": args.max_teacher_length,
+        },
+        "runtime": {
+            "model_id": args.model_id,
+            "device": str(device),
+            "seed": args.seed,
+        },
+        "logging": {
+            "log_latent_metrics": True,
+            "log_alignment_matrices": False,
+            "log_target_leakage_checks": True,
+            "log_host_losses": True,
+        },
+        "outputs": {
+            "metrics_path": str(metrics_path),
+            "summary_path": str(summary_path),
+            "config_snapshot_path": str(config_snapshot_path),
+        },
+    }
+
+
+def build_summary(
+    metrics_history: Sequence[Mapping[str, Any]],
+    *,
+    args: argparse.Namespace,
+    sample_count: int,
+    unique_samples_seen: int,
+    metrics_path: Path,
+    summary_path: Path,
+    config_snapshot_path: Path,
+) -> dict[str, Any]:
+    if not metrics_history:
+        raise RuntimeError("cannot build summary without metrics")
+    first = metrics_history[0]
+    last = metrics_history[-1]
+    tail_count = max(1, len(metrics_history) // 4)
+    tail = metrics_history[-tail_count:]
+    first_lsp = float(first["lsp_loss"])
+    last_lsp = float(last["lsp_loss"])
+    tail_lsp_mean = sum(float(item["lsp_loss"]) for item in tail) / len(tail)
+    lsp_loss_stable_or_decreasing = tail_lsp_mean <= first_lsp * args.loss_stability_ratio
+    lsp_loss_finite = all(math.isfinite(float(item["lsp_loss"])) for item in metrics_history)
+    host_answer_ce_finite = all(
+        math.isfinite(float(item["host_answer_ce"])) for item in metrics_history
+    )
+    latent_variance_nonzero = all(
+        float(item["latent_variance_mean"]) > args.collapse_eps
+        for item in metrics_history
+    )
+    pairwise_cosine_not_all_one = not any(
+        bool(item["pairwise_cosine_all_one"]) for item in metrics_history
+    )
+    answer_ce_double_count_ok = all(
+        bool(item["answer_ce_double_count_ok"]) for item in metrics_history
+    )
+    answer_leakage_ok = all(bool(item["answer_leakage_ok"]) for item in metrics_history)
+    teacher_no_grad = all(int(item["teacher_grad_params"]) == 0 for item in metrics_history)
+    acceptance = {
+        "training_completed": len(metrics_history) == args.max_steps,
+        "processed_100_to_1000_unique_samples": 100 <= unique_samples_seen <= 1000,
+        "lsp_loss_calculable": lsp_loss_finite,
+        "lsp_loss_stable_or_decreasing": lsp_loss_stable_or_decreasing,
+        "host_answer_ce_calculable": host_answer_ce_finite,
+        "answer_ce_double_count_ok": answer_ce_double_count_ok,
+        "latent_variance_nonzero": latent_variance_nonzero,
+        "pairwise_cosine_not_all_one": pairwise_cosine_not_all_one,
+        "teacher_no_grad": teacher_no_grad,
+        "answer_leakage_ok": answer_leakage_ok,
+    }
+    acceptance["passed"] = all(acceptance.values())
+    return {
+        "run": {
+            "name": "pr9_mvp",
+            "metrics_path": str(metrics_path),
+            "summary_path": str(summary_path),
+            "config_snapshot_path": str(config_snapshot_path),
+            "steps_completed": len(metrics_history),
+            "sample_count": sample_count,
+            "unique_samples_seen": unique_samples_seen,
+        },
+        "loss_curve": {
+            "first_lsp_loss": first_lsp,
+            "last_lsp_loss": last_lsp,
+            "tail_lsp_loss_mean": tail_lsp_mean,
+            "lsp_loss_delta_last_minus_first": last_lsp - first_lsp,
+            "loss_stability_ratio": args.loss_stability_ratio,
+        },
+        "answer_ce": {
+            "host_answer_ce_first": float(first["host_answer_ce"]),
+            "host_answer_ce_last": float(last["host_answer_ce"]),
+            "host_answer_ce_weight": args.host_answer_ce_weight,
+            "terms_in_total": list(last["answer_ce_terms_in_total"]),
+            "double_count_ok": answer_ce_double_count_ok,
+        },
+        "collapse": {
+            "latent_variance_mean_first": float(first["latent_variance_mean"]),
+            "latent_variance_mean_last": float(last["latent_variance_mean"]),
+            "latent_variance_min_last": float(last["latent_variance_min"]),
+            "effective_rank_last": float(last["effective_rank"]),
+            "pairwise_cosine_mean_last": float(last["pairwise_cosine_mean"]),
+            "pairwise_cosine_min_last": float(last["pairwise_cosine_min"]),
+            "pairwise_cosine_max_last": float(last["pairwise_cosine_max"]),
+            "pairwise_cosine_all_one_last": bool(last["pairwise_cosine_all_one"]),
+            "pairwise_l2_mean_last": float(last["pairwise_l2_mean"]),
+        },
+        "acceptance": acceptance,
+    }
+
+
+def write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_config_snapshot(path: Path, config: Mapping[str, Any]) -> None:
+    path.write_text(to_simple_yaml(config), encoding="utf-8")
+
+
+def to_simple_yaml(value: Any, *, indent: int = 0) -> str:
+    prefix = " " * indent
+    if isinstance(value, Mapping):
+        lines = []
+        for key, item in value.items():
+            if isinstance(item, Mapping) and item:
+                lines.append(f"{prefix}{key}:")
+                lines.append(to_simple_yaml(item, indent=indent + 2).rstrip())
+            elif isinstance(item, list):
+                if not item:
+                    lines.append(f"{prefix}{key}: []")
+                elif all(is_yaml_scalar(entry) for entry in item):
+                    rendered = ", ".join(yaml_scalar(entry) for entry in item)
+                    lines.append(f"{prefix}{key}: [{rendered}]")
+                else:
+                    lines.append(f"{prefix}{key}:")
+                    lines.append(to_simple_yaml(item, indent=indent + 2).rstrip())
+            else:
+                lines.append(f"{prefix}{key}: {yaml_scalar(item)}")
+        return "\n".join(lines) + "\n"
+    if isinstance(value, list):
+        if not value:
+            return f"{prefix}[]\n"
+        if all(is_yaml_scalar(item) for item in value):
+            return f"{prefix}[{', '.join(yaml_scalar(item) for item in value)}]\n"
+        lines = []
+        for item in value:
+            if isinstance(item, Mapping):
+                lines.append(f"{prefix}-")
+                lines.append(to_simple_yaml(item, indent=indent + 2).rstrip())
+            else:
+                lines.append(f"{prefix}- {yaml_scalar(item)}")
+        return "\n".join(lines) + "\n"
+    return f"{prefix}{yaml_scalar(value)}\n"
+
+
+def is_yaml_scalar(value: Any) -> bool:
+    return value is None or isinstance(value, (str, int, float, bool))
+
+
+def yaml_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    return json.dumps(str(value))
 
 
 def build_tokenizer_and_model(

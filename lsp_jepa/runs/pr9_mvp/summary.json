@@ -1,0 +1,51 @@
+{
+  "acceptance": {
+    "answer_ce_double_count_ok": true,
+    "answer_leakage_ok": true,
+    "host_answer_ce_calculable": true,
+    "latent_variance_nonzero": true,
+    "lsp_loss_calculable": true,
+    "lsp_loss_stable_or_decreasing": true,
+    "pairwise_cosine_not_all_one": true,
+    "passed": true,
+    "processed_100_to_1000_unique_samples": true,
+    "teacher_no_grad": true,
+    "training_completed": true
+  },
+  "answer_ce": {
+    "double_count_ok": true,
+    "host_answer_ce_first": 5.638576507568359,
+    "host_answer_ce_last": 2.7927215099334717,
+    "host_answer_ce_weight": 0.05,
+    "terms_in_total": [
+      "host_answer_ce"
+    ]
+  },
+  "collapse": {
+    "effective_rank_last": 2.067723512649536,
+    "latent_variance_mean_first": 0.24325022101402283,
+    "latent_variance_mean_last": 0.03135809302330017,
+    "latent_variance_min_last": 0.0002477299130987376,
+    "pairwise_cosine_all_one_last": false,
+    "pairwise_cosine_max_last": 0.9999994039535522,
+    "pairwise_cosine_mean_last": 0.9668934941291809,
+    "pairwise_cosine_min_last": 0.9285132884979248,
+    "pairwise_l2_mean_last": 1.8097431659698486
+  },
+  "loss_curve": {
+    "first_lsp_loss": 0.020080607384443283,
+    "last_lsp_loss": 0.017177410423755646,
+    "loss_stability_ratio": 1.05,
+    "lsp_loss_delta_last_minus_first": -0.0029031969606876373,
+    "tail_lsp_loss_mean": 0.01709649572148919
+  },
+  "run": {
+    "config_snapshot_path": "/root/SIM-CoT/lsp_jepa/runs/pr9_mvp/config_snapshot.yaml",
+    "metrics_path": "/root/SIM-CoT/lsp_jepa/runs/pr9_mvp/metrics.jsonl",
+    "name": "pr9_mvp",
+    "sample_count": 128,
+    "steps_completed": 16,
+    "summary_path": "/root/SIM-CoT/lsp_jepa/runs/pr9_mvp/summary.json",
+    "unique_samples_seen": 128
+  }
+}

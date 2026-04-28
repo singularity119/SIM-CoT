@@ -1,0 +1,74 @@
+experiment:
+  mode: "core"
+  host: "simcot"
+  backbone: "lsp"
+  use_lsp_jepa: true
+  run_kind: "PR9-MVP sequence-level debug train"
+teacher:
+  ema_decay: 0.995
+  update_trainable_only: true
+  output_hidden_states: true
+  target_layer: "last_2"
+  target_pooling: "step_last_token"
+  target_space: "raw_hidden"
+  exclude_answer_tokens: true
+  exclude_answer_prefix: true
+  reasoning_step_filter: "exclude_answer_only_steps"
+student:
+  latent_arch: "latent_tokens"
+  num_latent_steps: 4
+  latent_dim: null
+  use_predictor_head: false
+  predictor_head_layers: 0
+  normalize_latents: true
+  detach_between_steps: false
+lsp_objective:
+  type: "state"
+  state_offset: 0
+  transition_weight: 0.0
+mapping:
+  strategy: "sequence"
+  sparse_positions: ["first", "middle", "final"]
+  attention_coverage_weight: 0.0
+loss:
+  alignment: "normalized_mse"
+  align_weight: 1.0
+  anti_collapse: "none"
+  anti_collapse_weight: 0.0
+  answer_readout_weight: 0.0
+host_losses:
+  host_answer_ce_weight: 0.05
+  codi_distill_weight: 0.0
+  simcot_decoder_weight: 0.0
+  intermediate_cot_ce_weight: 0.0
+  answer_ce_terms_in_total: ["host_answer_ce"]
+  answer_ce_double_count_ok: true
+optimization:
+  optimizer: "AdamW"
+  lr: 0.002
+  weight_decay: 0.0
+  max_steps: 16
+  batch_size: 8
+  single_backward_per_batch: true
+  ema_update_after_optimizer_step: true
+data:
+  source: "synthetic"
+  dataset_split: "train"
+  dataset_config: "main"
+  num_samples_requested: 128
+  num_samples_loaded: 128
+  min_samples: 100
+  max_teacher_length: 256
+runtime:
+  model_id: "tiny"
+  device: "cuda"
+  seed: 0
+logging:
+  log_latent_metrics: true
+  log_alignment_matrices: false
+  log_target_leakage_checks: true
+  log_host_losses: true
+outputs:
+  metrics_path: "/root/SIM-CoT/lsp_jepa/runs/pr9_mvp/metrics.jsonl"
+  summary_path: "/root/SIM-CoT/lsp_jepa/runs/pr9_mvp/summary.json"
+  config_snapshot_path: "/root/SIM-CoT/lsp_jepa/runs/pr9_mvp/config_snapshot.yaml"
