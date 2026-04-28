@@ -1735,8 +1735,47 @@ def build_tokenizer_and_model(
         raise ValueError("tokenizer must define eos_token_id")
     tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>", "<|latent|>"])
     model = AutoModelForCausalLM.from_pretrained(args.model_id)
+    ensure_legacy_past_key_values(model)
     model.resize_token_embeddings(len(tokenizer))
     return tokenizer, model
+
+
+def ensure_legacy_past_key_values(model: nn.Module) -> None:
+    """Keep upstream Coconut compatible with newer transformers cache objects."""
+    if getattr(model, "_lsp_jepa_legacy_cache_wrapped", False):
+        return
+    original_forward = model.forward
+
+    def forward_with_legacy_cache(*args: Any, **kwargs: Any) -> Any:
+        past_key_values = kwargs.get("past_key_values")
+        if isinstance(past_key_values, (list, tuple)):
+            try:
+                from transformers.cache_utils import DynamicCache
+            except ImportError:
+                pass
+            else:
+                kwargs = dict(kwargs)
+                kwargs["past_key_values"] = DynamicCache(
+                    past_key_values,
+                    config=getattr(model, "config", None),
+                )
+        outputs = original_forward(*args, **kwargs)
+        past_key_values = getattr(outputs, "past_key_values", None)
+        if hasattr(past_key_values, "to_legacy_cache"):
+            outputs.past_key_values = past_key_values.to_legacy_cache()
+        elif past_key_values is not None:
+            legacy_cache = []
+            for layer_cache in past_key_values:
+                if not isinstance(layer_cache, tuple) or len(layer_cache) < 2:
+                    legacy_cache = []
+                    break
+                legacy_cache.append((layer_cache[0], layer_cache[1]))
+            if legacy_cache:
+                outputs.past_key_values = tuple(legacy_cache)
+        return outputs
+
+    model.forward = forward_with_legacy_cache  # type: ignore[method-assign]
+    model._lsp_jepa_legacy_cache_wrapped = True  # type: ignore[attr-defined]
 
 
 def warm_tokenizer_vocab(
