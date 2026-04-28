@@ -1,0 +1,4 @@
+# Minimal PR7-MVP training closure.
+# The default smoke run only needs torch; transformers is needed for --model-id.
+torch>=2.5
+transformers>=4.46
