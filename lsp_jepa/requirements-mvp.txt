@@ -1,4 +1,6 @@
-# Minimal PR7-MVP training closure.
-# The default smoke run only needs torch; transformers is needed for --model-id.
+# Minimal PR8-MVP training closure.
+# The default PR8 smoke run only needs torch; transformers is needed for
+# --model-id and datasets is useful for --dataset-source gsm8k/gsm8k_aug.
 torch>=2.5
 transformers>=4.46
+datasets>=2.19

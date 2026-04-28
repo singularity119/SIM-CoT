@@ -1,8 +1,10 @@
-"""Minimal sequence-level LSP-JEPA training closure on Coconut.
+"""Minimal sequence-level LSP-JEPA smoke training closure on Coconut.
 
 This script is intentionally small: one student forward, one EMA-teacher target
-forward, one scalar sequence-level alignment loss, one host answer CE term, one
-backward/optimizer step, and one EMA update.
+forward, one scalar sequence-level alignment loss, optional host answer CE, one
+backward/optimizer step, one EMA update, and JSONL metrics. It supports tiny
+real GSM8K/GSM8K-Aug style samples without adding step-level objectives,
+adapter expansion, distributed training, wandb, or checkpoint management.
 """
 
 from __future__ import annotations
@@ -13,6 +15,10 @@ import math
 import re
 import sys
 import types
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,6 +68,7 @@ class Sample:
     question: str
     cot_steps: list[str]
     answer: str
+    source: str = "unknown"
 
 
 class MinimalTokenizer:
@@ -234,13 +241,20 @@ class TinyCausalLM(nn.Module):
 def main() -> None:
     args = parse_args()
     if args.objective != "sequence":
-        raise ValueError("PR7-MVP only supports objective=sequence")
+        raise ValueError("PR8-MVP only supports objective=sequence")
+    if args.max_steps < 1:
+        raise ValueError("--max-steps must be at least 1")
     if args.num_latent_steps < 1:
         raise ValueError("--num-latent-steps must be at least 1")
 
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
-    samples = default_samples()[: args.batch_size]
+    samples = load_samples(args)
+    if len(samples) < args.batch_size:
+        raise RuntimeError(
+            f"need at least batch_size={args.batch_size} samples, found {len(samples)}"
+        )
+    samples = samples[: args.batch_size]
 
     tokenizer, base_model = build_tokenizer_and_model(args, samples)
     base_model.to(device)
@@ -269,6 +283,10 @@ def main() -> None:
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    metrics_path = resolve_metrics_path(args.metrics_path)
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    if metrics_path.exists() and not args.append_metrics:
+        metrics_path.unlink()
 
     student_batch = build_student_batch(
         tokenizer,
@@ -280,90 +298,125 @@ def main() -> None:
         device=device,
     )
     teacher_inputs = build_teacher_batch(tokenizer, samples, args, device)
-
-    teacher_output = ema_teacher(
-        input_ids=teacher_inputs["input_ids"],
-        attention_mask=teacher_inputs["attention_mask"],
-        output_hidden_states=True,
+    answer_leakage_ok = validate_no_answer_leakage(
+        samples,
+        teacher_inputs,
+        include_answer_tokens=args.include_answer_tokens,
+        include_answer_prefix=args.include_answer_prefix,
     )
-    teacher_targets = gather_step_boundary_hidden_states(
-        teacher_output,
-        teacher_inputs["step_boundaries"],
-        teacher_inputs["step_mask"],
-        attention_mask=teacher_inputs["attention_mask"],
-        step_starts=teacher_inputs["step_starts"],
-        target_layer=args.target_layer,
-        target_pooling="step_last_token",
-        detach=True,
-    )
-    final_teacher = select_last_valid_target(teacher_targets)
-
     adapter = CoconutLSPAdapter(latent_token_id=latent_id)
-    host_output = adapter.forward_student(
-        student,
-        {"student_inputs": student_batch},
-        output_latent_states=True,
-    )
-    h_final, h_final_mask = select_last_valid_state(
-        host_output.latent_states,
-        host_output.latent_mask,
-    )
-    z_final = final_teacher.target_states.to(device=h_final.device, dtype=h_final.dtype)
-    z_final_mask = final_teacher.target_mask.to(device=h_final.device)
-    final_mask = h_final_mask & z_final_mask
 
-    lsp_loss = compute_lsp_state_loss(
-        h_final,
-        z_final,
-        final_mask,
-        alignment="normalized_mse",
-    )
-    host_answer_ce = host_output.host_losses.get("host_answer_ce")
-    if host_answer_ce is None:
-        raise RuntimeError("Coconut host output did not provide host_answer_ce")
-    total_loss = args.lsp_weight * lsp_loss + args.host_answer_ce_weight * host_answer_ce
-    latent_variance = per_dim_variance(h_final, final_mask)["mean"]
+    for train_step in range(1, args.max_steps + 1):
+        teacher_output = ema_teacher(
+            input_ids=teacher_inputs["teacher_input_ids"],
+            attention_mask=teacher_inputs["attention_mask"],
+            output_hidden_states=True,
+        )
+        teacher_targets = gather_step_boundary_hidden_states(
+            teacher_output,
+            teacher_inputs["step_boundaries"],
+            teacher_inputs["step_mask"],
+            attention_mask=teacher_inputs["attention_mask"],
+            step_starts=teacher_inputs["step_starts"],
+            target_layer=args.target_layer,
+            target_pooling="step_last_token",
+            detach=True,
+        )
+        teacher_target_mask_nonempty = bool(
+            teacher_targets.target_mask.any().detach().cpu().item()
+        )
+        if not teacher_target_mask_nonempty:
+            raise RuntimeError("teacher target mask is empty")
+        final_teacher = select_last_valid_target(teacher_targets)
 
-    validate_finite("total_loss", total_loss)
-    validate_finite("lsp_loss", lsp_loss)
-    validate_finite("host_answer_ce", host_answer_ce)
-    validate_finite("latent_variance", latent_variance)
-    if not bool(final_mask.any().detach().cpu().item()):
-        raise RuntimeError("no valid final sequence alignment targets were found")
+        host_output = adapter.forward_student(
+            student,
+            {"student_inputs": student_batch},
+            output_latent_states=True,
+        )
+        latent_mask_nonempty = bool(host_output.latent_mask.any().detach().cpu().item())
+        if not latent_mask_nonempty:
+            raise RuntimeError("student latent mask is empty")
+        h_final, h_final_mask = select_last_valid_state(
+            host_output.latent_states,
+            host_output.latent_mask,
+        )
+        z_final = final_teacher.target_states.to(device=h_final.device, dtype=h_final.dtype)
+        z_final_mask = final_teacher.target_mask.to(device=h_final.device)
+        final_mask = h_final_mask & z_final_mask
 
-    optimizer.zero_grad(set_to_none=True)
-    total_loss.backward()
-    student_grad_l1 = grad_l1(student)
-    if student_grad_l1 <= 0.0 or not math.isfinite(student_grad_l1):
-        raise RuntimeError("student parameters did not receive finite gradients")
-    if any(param.grad is not None for param in ema_teacher.parameters()):
-        raise RuntimeError("EMA teacher parameters received gradients")
+        lsp_loss = compute_lsp_state_loss(
+            h_final,
+            z_final,
+            final_mask,
+            alignment="normalized_mse",
+        )
+        host_answer_ce = host_output.host_losses.get("host_answer_ce")
+        if host_answer_ce is None:
+            raise RuntimeError("Coconut host output did not provide host_answer_ce")
+        total_loss = args.lsp_weight * lsp_loss + args.host_answer_ce_weight * host_answer_ce
+        latent_variance = per_dim_variance(h_final, final_mask)["mean"]
 
-    teacher_before = clone_params(ema_teacher.teacher_model)
-    optimizer.step()
-    ema_teacher.update(student.base_causallm)
-    teacher_delta_l1 = param_delta_l1(teacher_before, ema_teacher.teacher_model)
-    if teacher_delta_l1 <= 0.0 or not math.isfinite(teacher_delta_l1):
-        raise RuntimeError("EMA update did not change teacher parameters")
+        validate_finite("total_loss", total_loss)
+        validate_finite("lsp_loss", lsp_loss)
+        validate_finite("host_answer_ce", host_answer_ce)
+        validate_finite("latent_variance", latent_variance)
+        if not bool(final_mask.any().detach().cpu().item()):
+            raise RuntimeError("no valid final sequence alignment targets were found")
 
-    metrics = {
-        "total_loss": to_float(total_loss),
-        "lsp_loss": to_float(lsp_loss),
-        "host_answer_ce": to_float(host_answer_ce),
-        "latent_variance": to_float(latent_variance),
-        "student_grad_l1": student_grad_l1,
-        "teacher_grad_params": sum(param.grad is not None for param in ema_teacher.parameters()),
-        "teacher_delta_l1": teacher_delta_l1,
-        "valid_final_targets": int(final_mask.sum().detach().cpu().item()),
-    }
-    print(json.dumps(metrics, indent=2, sort_keys=True))
+        optimizer.zero_grad(set_to_none=True)
+        total_loss.backward()
+        student_grad_l1 = grad_l1(student)
+        if student_grad_l1 <= 0.0 or not math.isfinite(student_grad_l1):
+            raise RuntimeError("student parameters did not receive finite gradients")
+        if any(param.grad is not None for param in ema_teacher.parameters()):
+            raise RuntimeError("EMA teacher parameters received gradients")
+
+        teacher_before = clone_params(ema_teacher.teacher_model)
+        optimizer.step()
+        ema_teacher.update(student.base_causallm)
+        teacher_delta_l1 = param_delta_l1(teacher_before, ema_teacher.teacher_model)
+        if teacher_delta_l1 <= 0.0 or not math.isfinite(teacher_delta_l1):
+            raise RuntimeError("EMA update did not change teacher parameters")
+
+        metrics = {
+            "step": train_step,
+            "max_steps": args.max_steps,
+            "data_source": args.dataset_source if args.data_path is None else str(args.data_path),
+            "sample_sources": [sample.source for sample in samples],
+            "total_loss": to_float(total_loss),
+            "lsp_loss": to_float(lsp_loss),
+            "host_answer_ce": to_float(host_answer_ce),
+            "host_answer_ce_weight": args.host_answer_ce_weight,
+            "latent_variance": to_float(latent_variance),
+            "student_grad_l1": student_grad_l1,
+            "teacher_grad_params": sum(
+                param.grad is not None for param in ema_teacher.parameters()
+            ),
+            "teacher_delta_l1": teacher_delta_l1,
+            "teacher_target_mask_nonempty": teacher_target_mask_nonempty,
+            "latent_mask_nonempty": latent_mask_nonempty,
+            "valid_teacher_targets": int(
+                teacher_targets.target_mask.sum().detach().cpu().item()
+            ),
+            "valid_final_targets": int(final_mask.sum().detach().cpu().item()),
+            "teacher_input_ids_shape": list(teacher_inputs["teacher_input_ids"].shape),
+            "final_valid_step_position": tensor_to_int_list(
+                teacher_inputs["final_valid_step_position"]
+            ),
+            "answer_leakage_ok": answer_leakage_ok,
+        }
+        append_metrics(metrics_path, metrics)
+        print(json.dumps(metrics, sort_keys=True))
+
+    print(json.dumps({"metrics_path": str(metrics_path), "completed_steps": args.max_steps}))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-id", default="tiny", help="'tiny' or a local/HF model id")
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
-    parser.add_argument("--max-steps", type=int, default=1)
+    parser.add_argument("--max-steps", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -375,6 +428,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-layer", default="last_2")
     parser.add_argument("--num-latent-steps", type=int, default=2)
     parser.add_argument("--max-teacher-length", type=int, default=256)
+    parser.add_argument("--metrics-path", default="lsp_jepa/runs/pr8_mvp/metrics.jsonl")
+    parser.add_argument("--append-metrics", action="store_true")
+    parser.add_argument("--data-path", type=Path)
+    parser.add_argument(
+        "--dataset-source",
+        default="gsm8k_smoke",
+        choices=("gsm8k_smoke", "gsm8k", "gsm8k_aug", "synthetic"),
+    )
+    parser.add_argument("--dataset-split", default="train")
+    parser.add_argument("--dataset-config", default="main")
+    parser.add_argument("--num-samples", type=int, default=8)
     parser.add_argument("--include-answer-tokens", action="store_true")
     parser.add_argument("--include-answer-prefix", action="store_true")
     parser.add_argument(
@@ -382,10 +446,7 @@ def parse_args() -> argparse.Namespace:
         default="exclude_answer_only_steps",
         choices=("exclude_answer_only_steps", "none"),
     )
-    args = parser.parse_args()
-    if args.max_steps != 1:
-        raise ValueError("PR7-MVP acceptance only supports --max-steps 1")
-    return args
+    return parser.parse_args()
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -406,6 +467,7 @@ def default_samples() -> list[Sample]:
                 "#### 5",
             ],
             answer="5",
+            source="synthetic",
         ),
         Sample(
             question="A box has four red pens and three blue pens. How many pens?",
@@ -415,8 +477,229 @@ def default_samples() -> list[Sample]:
                 "The answer is 7",
             ],
             answer="7",
+            source="synthetic",
         ),
     ]
+
+
+def load_samples(args: argparse.Namespace) -> list[Sample]:
+    if args.data_path is not None:
+        return load_samples_from_path(args.data_path, limit=args.num_samples)
+    if args.dataset_source == "synthetic":
+        return default_samples()[: args.num_samples]
+    if args.dataset_source == "gsm8k_smoke":
+        return load_samples_from_path(
+            REPO_ROOT / "lsp_jepa" / "data" / "gsm8k_smoke.jsonl",
+            limit=args.num_samples,
+        )
+    dataset_id = "gsm8k" if args.dataset_source == "gsm8k" else "zen-E/GSM8k-Aug"
+    config = args.dataset_config if args.dataset_source == "gsm8k" else None
+    return load_hf_dataset_samples(
+        dataset_id=dataset_id,
+        config=config,
+        split=args.dataset_split,
+        limit=args.num_samples,
+    )
+
+
+def load_samples_from_path(path: Path, *, limit: int) -> list[Sample]:
+    path = resolve_repo_path(path)
+    records = read_records(path)
+    samples = samples_from_records(records, source=str(path))
+    return require_enough_samples(samples[:limit], path)
+
+
+def load_hf_dataset_samples(
+    *,
+    dataset_id: str,
+    config: str | None,
+    split: str,
+    limit: int,
+) -> list[Sample]:
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        rows = load_hf_rows_via_dataset_server(
+            dataset_id=dataset_id,
+            config=config,
+            split=split,
+            limit=limit,
+        )
+    else:
+        if config is None:
+            dataset = load_dataset(dataset_id, split=split)
+        else:
+            dataset = load_dataset(dataset_id, config, split=split)
+        rows = [dataset[idx] for idx in range(min(limit, len(dataset)))]
+    return require_enough_samples(
+        samples_from_records(rows, source=f"hf:{dataset_id}:{split}")[:limit],
+        dataset_id,
+    )
+
+
+def load_hf_rows_via_dataset_server(
+    *,
+    dataset_id: str,
+    config: str | None,
+    split: str,
+    limit: int,
+) -> list[Mapping[str, Any]]:
+    query: dict[str, str] = {
+        "dataset": dataset_id,
+        "split": split,
+        "offset": "0",
+        "length": str(limit),
+    }
+    if config is not None:
+        query["config"] = config
+    url = "https://datasets-server.huggingface.co/rows?" + urllib.parse.urlencode(query)
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError) as exc:
+        raise RuntimeError(
+            "datasets is not installed and Hugging Face dataset-server rows "
+            f"could not be fetched for {dataset_id}; pass --data-path instead"
+        ) from exc
+    if "rows" not in payload:
+        raise RuntimeError(f"unexpected dataset-server response for {dataset_id}: {payload}")
+    rows = []
+    for item in payload["rows"]:
+        row = item.get("row", item)
+        if isinstance(row, Mapping):
+            rows.append(row)
+    return rows
+
+
+def read_records(path: Path) -> list[Mapping[str, Any]]:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if path.suffix.lower() == ".jsonl":
+        records = [json.loads(line) for line in text.splitlines() if line.strip()]
+    else:
+        payload = json.loads(text)
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, Mapping):
+            records = payload.get("data", [])
+        else:
+            records = []
+    if not isinstance(records, list):
+        raise ValueError(f"{path} must contain a JSON list or JSONL records")
+    return [record for record in records if isinstance(record, Mapping)]
+
+
+def samples_from_records(records: Sequence[Mapping[str, Any]], *, source: str) -> list[Sample]:
+    samples = []
+    for index, record in enumerate(records):
+        sample = sample_from_record(record, source=f"{source}#{index}")
+        if sample is not None:
+            samples.append(sample)
+    return samples
+
+
+def sample_from_record(record: Mapping[str, Any], *, source: str) -> Sample | None:
+    question = first_text(record, ("question", "query", "problem"))
+    if question is None:
+        return None
+
+    answer_value = first_text(record, ("answer", "final_answer", "target", "label"))
+    cot_value = first_value(
+        record,
+        ("cot", "steps", "rationale", "chain_of_thought", "solution", "response"),
+    )
+    cot_from_answer = None
+    if answer_value is not None:
+        cot_from_answer, answer_from_answer = split_gsm8k_answer(answer_value)
+        if answer_from_answer is not None:
+            answer_value = answer_from_answer
+    if cot_value is None:
+        cot_value = cot_from_answer
+
+    cot_steps = split_cot_steps(cot_value)
+    answer = clean_answer(answer_value)
+    if not question.strip() or not cot_steps or not answer:
+        return None
+    return Sample(
+        question=question.strip(),
+        cot_steps=cot_steps,
+        answer=answer,
+        source=source,
+    )
+
+
+def first_value(record: Mapping[str, Any], keys: Sequence[str]) -> Any | None:
+    for key in keys:
+        if key in record and record[key] not in (None, ""):
+            return record[key]
+    return None
+
+
+def first_text(record: Mapping[str, Any], keys: Sequence[str]) -> str | None:
+    value = first_value(record, keys)
+    if value is None:
+        return None
+    return str(value)
+
+
+def split_gsm8k_answer(answer_text: str) -> tuple[str | None, str | None]:
+    parts = str(answer_text).split("####", maxsplit=1)
+    if len(parts) == 1:
+        return None, None
+    cot = parts[0].strip()
+    answer = clean_answer(parts[1])
+    return cot or None, answer or None
+
+
+def split_cot_steps(value: Any | None) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        steps = [str(step).strip() for step in value]
+    else:
+        text = str(value).replace("\r\n", "\n").strip()
+        line_steps = [line.strip() for line in text.split("\n") if line.strip()]
+        if len(line_steps) > 1:
+            steps = line_steps
+        else:
+            steps = [
+                part.strip()
+                for part in re.split(r"(?<=[.!?])\s+", text)
+                if part.strip()
+            ]
+    return [
+        step
+        for step in steps
+        if step and not step.lstrip().startswith("####")
+    ]
+
+
+def clean_answer(value: Any | None) -> str:
+    if value is None:
+        return ""
+    answer = str(value).strip()
+    answer = answer.replace("####", "").strip()
+    answer = re.sub(r"(?i)^(?:the\s+)?answer\s+is\s*:?\s*", "", answer).strip()
+    answer = re.sub(r"(?i)^final\s+answer\s*:?\s*", "", answer).strip()
+    return answer
+
+
+def require_enough_samples(samples: list[Sample], source: object) -> list[Sample]:
+    if not samples:
+        raise RuntimeError(f"no usable GSM8K-style samples found in {source}")
+    return samples
+
+
+def resolve_repo_path(path: Path) -> Path:
+    return path if path.is_absolute() else REPO_ROOT / path
+
+
+def resolve_metrics_path(path_text: str) -> Path:
+    path = Path(path_text)
+    return path if path.is_absolute() else REPO_ROOT / path
 
 
 def build_tokenizer_and_model(
@@ -562,7 +845,59 @@ def build_teacher_batch(
     tensor_keys = {"input_ids", "attention_mask", "step_boundaries", "step_starts", "step_mask"}
     for key in tensor_keys:
         batch[key] = batch[key].to(device)
+    batch["teacher_input_ids"] = batch["input_ids"]
+    batch["final_valid_step_position"] = final_valid_step_position(
+        batch["step_boundaries"],
+        batch["step_mask"],
+    )
     return batch
+
+
+def final_valid_step_position(
+    step_boundaries: torch.Tensor,
+    step_mask: torch.Tensor,
+) -> torch.Tensor:
+    if step_boundaries.ndim != 2 or step_mask.ndim != 2:
+        raise ValueError("step_boundaries and step_mask must have shape [batch, steps]")
+    if step_boundaries.shape != step_mask.shape:
+        raise ValueError("step_boundaries and step_mask shape mismatch")
+    mask = step_mask.to(device=step_boundaries.device, dtype=torch.bool)
+    counts = mask.to(dtype=torch.long).sum(dim=1)
+    last_step = (counts - 1).clamp_min(0)
+    final_position = step_boundaries.gather(1, last_step.view(-1, 1)).squeeze(1)
+    return torch.where(counts.gt(0), final_position, torch.zeros_like(final_position))
+
+
+def validate_no_answer_leakage(
+    samples: Sequence[Sample],
+    teacher_inputs: Mapping[str, Any],
+    *,
+    include_answer_tokens: bool,
+    include_answer_prefix: bool,
+) -> bool:
+    if include_answer_tokens or include_answer_prefix:
+        raise RuntimeError("answer leakage check failed: answer targets were explicitly included")
+    texts = teacher_inputs.get("texts", [])
+    filtered_steps = teacher_inputs.get("filtered_steps", [])
+    for sample, text, steps in zip(samples, texts, filtered_steps, strict=True):
+        if "####" in str(text):
+            raise RuntimeError(f"answer leakage check failed for {sample.source}: found ####")
+        for step in steps:
+            if looks_like_answer_prefix(str(step)):
+                raise RuntimeError(
+                    f"answer leakage check failed for {sample.source}: {step!r}"
+                )
+    return True
+
+
+def looks_like_answer_prefix(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?i)(?:^|\b)(?:the\s+)?answer\s+is\b|"
+            r"(?:^|\b)final\s+answer\b|####",
+            text,
+        )
+    )
 
 
 def select_last_valid_target(targets: TeacherTargetBatch) -> TeacherTargetBatch:
@@ -633,6 +968,15 @@ def param_delta_l1(before: dict[str, torch.Tensor], module: nn.Module) -> float:
 
 def to_float(value: torch.Tensor) -> float:
     return float(value.detach().cpu().item())
+
+
+def tensor_to_int_list(value: torch.Tensor) -> list[int]:
+    return [int(item) for item in value.detach().cpu().tolist()]
+
+
+def append_metrics(path: Path, metrics: Mapping[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(metrics, sort_keys=True) + "\n")
 
 
 if __name__ == "__main__":
