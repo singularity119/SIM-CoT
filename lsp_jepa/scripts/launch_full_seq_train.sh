@@ -10,6 +10,7 @@ MAX_STEPS=""
 DRY_RUN=0
 DEVICE=""
 MODEL_ID=""
+SAVE_EVERY=""
 EXTRA_ARGS=()
 
 usage() {
@@ -29,6 +30,7 @@ Options:
   --max-steps N             Run N optimizer steps on the configured full training split.
   --device DEVICE           Forward to train_lsp_jepa_core.py.
   --model-id ID             Forward to train_lsp_jepa_core.py.
+  --save-every N            Forward checkpoint interval to train_lsp_jepa_core.py.
   -h, --help                Show this help.
 
 Examples:
@@ -70,6 +72,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --model-id)
       MODEL_ID="$2"
+      shift 2
+      ;;
+    --save-every)
+      SAVE_EVERY="$2"
       shift 2
       ;;
     -h|--help)
@@ -202,6 +208,9 @@ fi
 if [[ -n "$MODEL_ID" ]]; then
   CMD+=(--model-id "$MODEL_ID")
 fi
+if [[ -n "$SAVE_EVERY" ]]; then
+  CMD+=(--save-every "$SAVE_EVERY")
+fi
 CMD+=("${EXTRA_ARGS[@]}")
 
 {
@@ -263,10 +272,17 @@ def finite_row(row):
             return False
     return True
 
-tail_count = max(1, len(metrics) // 4)
-tail = metrics[-tail_count:]
+diagnostic_metrics = [
+    row for row in metrics
+    if len(row.get("batch_sample_ids") or []) > 1
+]
+if not diagnostic_metrics:
+    diagnostic_metrics = metrics
+tail_count = max(1, len(diagnostic_metrics) // 4)
+tail = diagnostic_metrics[-tail_count:]
 pairwise_tail_mean = sum(float(row["pairwise_cosine_mean"]) for row in tail) / len(tail)
-threshold = float(metrics[-1]["max_steps"] and metrics[-1].get("pairwise_cosine_near_one") is not None and 0.999)
+last_diagnostic = diagnostic_metrics[-1]
+threshold = float(last_diagnostic["max_steps"] and last_diagnostic.get("pairwise_cosine_near_one") is not None and 0.999)
 gate = {
     "mode_core": all(row.get("experiment_mode") == "core" for row in metrics),
     "objective_lsp_state": all(row.get("objective") == "lsp_state" for row in metrics),
@@ -277,8 +293,8 @@ gate = {
     "teacher_no_grad": all(int(row["teacher_grad_params"]) == 0 for row in metrics),
     "student_has_grad": all(float(row["student_grad_l1"]) > 0.0 and float(row["student_base_grad_l1"]) > 0.0 for row in metrics),
     "ema_drift_nonzero": all(float(row["ema_drift_l1"]) > 0.0 for row in metrics),
-    "latent_variance_nonzero": all(float(row["latent_variance_mean"]) > 1e-10 for row in metrics),
-    "pairwise_cosine_not_long_near_one": pairwise_tail_mean < threshold and not any(row.get("pairwise_cosine_all_one") for row in metrics),
+    "latent_variance_nonzero": all(float(row["latent_variance_mean"]) > 1e-10 for row in diagnostic_metrics),
+    "pairwise_cosine_not_long_near_one": pairwise_tail_mean < threshold and not any(row.get("pairwise_cosine_all_one") for row in diagnostic_metrics),
     "host_answer_ce_not_double_counted": all(bool(row["answer_ce_double_count_ok"]) and row["answer_ce_terms_in_total"] in ([], ["host_answer_ce"]) for row in metrics),
     "teacher_targets_nonempty": all(bool(row["teacher_target_mask_nonempty"]) for row in metrics),
     "student_latents_nonempty": all(bool(row["latent_mask_nonempty"]) for row in metrics),
@@ -301,6 +317,9 @@ summary["pr13_mvp"] = {
     "ema_drift_l1_last": metrics[-1]["ema_drift_l1"],
     "latent_variance_mean_last": metrics[-1]["latent_variance_mean"],
     "pairwise_cosine_tail_mean": pairwise_tail_mean,
+    "diagnostic_rows": len(diagnostic_metrics),
+    "latest_diagnostic_latent_variance_mean": last_diagnostic["latent_variance_mean"],
+    "latest_diagnostic_pairwise_cosine_mean": last_diagnostic["pairwise_cosine_mean"],
     "gate": gate,
 }
 summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")

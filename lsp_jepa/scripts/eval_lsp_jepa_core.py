@@ -31,6 +31,7 @@ from lsp_jepa.scripts.train_lsp_jepa_core import (  # noqa: E402
     LatentPredictor,
     MinimalTokenizer,
     TinyCausalLM,
+    build_tokenizer_and_model,
     clean_answer,
     config_get,
     load_hf_dataset_samples,
@@ -62,10 +63,12 @@ def main() -> None:
 
     samples = load_eval_samples(args)
     checkpoint = load_checkpoint(checkpoint_path)
-    tokenizer = build_eval_tokenizer(samples, args.num_latent_steps)
+    tokenizer, base_model = build_eval_tokenizer_and_model(samples, args)
     student, predictor, load_status = build_and_load_student(
         checkpoint,
         tokenizer=tokenizer,
+        base_model=base_model,
+        model_id=args.model_id,
         num_latent_steps=args.num_latent_steps,
         predictor_head_layers=args.predictor_head_layers,
         use_predictor_head=args.use_predictor_head,
@@ -74,7 +77,8 @@ def main() -> None:
     load_status["tokenizer"] = {
         "loaded_from_checkpoint": False,
         "checkpoint_contains_tokenizer": isinstance(checkpoint, Mapping) and "tokenizer" in checkpoint,
-        "reconstructed_from_eval_samples": True,
+        "reconstructed_from_eval_samples": args.model_id == "tiny",
+        "loaded_from_model_id": args.model_id != "tiny",
         "eval_tokenizer_vocab_size": len(tokenizer),
     }
     student.eval()
@@ -199,8 +203,6 @@ def parse_args() -> argparse.Namespace:
     config_path = resolve_repo_path(args.config)
     if config_path.exists():
         apply_eval_config(args, load_yaml_config(config_path), provided)
-    if args.model_id != "tiny":
-        raise ValueError("PR14-MVP eval currently supports PR13 tiny checkpoints only")
     if args.limit_eval_samples is not None and args.limit_eval_samples < 1:
         raise ValueError("--limit-eval-samples must be positive")
     return args
@@ -272,6 +274,17 @@ def load_checkpoint(path: Path) -> Mapping[str, Any]:
     return checkpoint
 
 
+def build_eval_tokenizer_and_model(
+    samples: Sequence[Any],
+    args: argparse.Namespace,
+) -> tuple[Any, torch.nn.Module]:
+    if args.model_id != "tiny":
+        model_args = argparse.Namespace(model_id=args.model_id)
+        return build_tokenizer_and_model(model_args, list(samples))
+    tokenizer = build_eval_tokenizer(samples, args.num_latent_steps)
+    return tokenizer, TinyCausalLM(vocab_size=len(tokenizer))
+
+
 def build_eval_tokenizer(samples: Sequence[Any], num_latent_steps: int) -> MinimalTokenizer:
     tokenizer = MinimalTokenizer()
     tokenizer.add_tokens(["<|start-latent|>", "<|end-latent|>", "<|latent|>"])
@@ -286,15 +299,15 @@ def build_eval_tokenizer(samples: Sequence[Any], num_latent_steps: int) -> Minim
 def build_and_load_student(
     checkpoint: Mapping[str, Any],
     *,
-    tokenizer: MinimalTokenizer,
+    tokenizer: Any,
+    base_model: torch.nn.Module,
+    model_id: str,
     num_latent_steps: int,
     predictor_head_layers: int,
     use_predictor_head: bool,
     device: torch.device,
 ) -> tuple[Coconut, LatentPredictor, dict[str, Any]]:
     state = checkpoint.get("student_base_causallm", {}) if isinstance(checkpoint, Mapping) else {}
-    vocab_size = checkpoint_vocab_size(state, fallback=len(tokenizer))
-    base_model = TinyCausalLM(vocab_size=vocab_size)
     model_status = safe_load_state_dict(base_model, state)
     latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
     start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
@@ -308,7 +321,11 @@ def build_and_load_student(
     predictor_status = safe_load_state_dict(predictor, checkpoint.get("predictor", {}))
     student.to(device)
     predictor.to(device)
-    return student, predictor, {"student_base_causallm": model_status, "predictor": predictor_status}
+    return student, predictor, {
+        "model_id": model_id,
+        "student_base_causallm": model_status,
+        "predictor": predictor_status,
+    }
 
 
 def checkpoint_vocab_size(state: Mapping[str, torch.Tensor], *, fallback: int) -> int:
@@ -355,6 +372,8 @@ def trim_after_eos(token_ids: list[int], eos_token_id: int) -> list[int]:
 
 
 def decode_token_ids(tokenizer: MinimalTokenizer, token_ids: Sequence[int]) -> str:
+    if not isinstance(tokenizer, MinimalTokenizer) and hasattr(tokenizer, "decode"):
+        return tokenizer.decode(token_ids, skip_special_tokens=True).strip()
     tokens = []
     for token_id in token_ids:
         if token_id in (tokenizer.pad_token_id, tokenizer.eos_token_id, tokenizer.bos_token_id):
