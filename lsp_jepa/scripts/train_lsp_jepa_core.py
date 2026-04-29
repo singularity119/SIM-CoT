@@ -639,6 +639,9 @@ def main() -> None:
         metrics_history.append(metrics)
         update_tqdm_progress(progress, metrics)
         if should_log_step(args, train_step):
+            tqdm_log_line = build_tqdm_log_line(progress, metrics)
+            if tqdm_log_line is not None:
+                progress_write(progress, tqdm_log_line)
             progress_write(progress, json.dumps(metrics, sort_keys=True))
 
     close_tqdm_progress(progress)
@@ -1473,9 +1476,11 @@ def build_tqdm_progress(args: argparse.Namespace) -> Any:
     return tqdm(
         total=args.max_steps,
         desc=args.objective,
-        dynamic_ncols=True,
+        dynamic_ncols=sys.stdout.isatty(),
         mininterval=1.0,
         file=sys.stdout,
+        ascii=not sys.stdout.isatty(),
+        disable=not sys.stdout.isatty(),
     )
 
 
@@ -1492,11 +1497,34 @@ def update_tqdm_progress(progress: Any, metrics: Mapping[str, Any]) -> None:
     progress.update(1)
 
 
+def build_tqdm_log_line(progress: Any, metrics: Mapping[str, Any]) -> str | None:
+    if progress is None or tqdm is None:
+        return None
+    elapsed = float(getattr(progress, "format_dict", {}).get("elapsed") or 0.0)
+    postfix = (
+        f"total_loss={float(metrics['total_loss']):.6f}, "
+        f"lsp_loss={float(metrics['lsp_loss']):.6f}, "
+        f"host_answer_ce={float(metrics['host_answer_ce']):.6f}, "
+        f"latent_var={float(metrics['latent_variance_mean']):.4g}, "
+        f"epoch={int(metrics.get('epoch_index', 0))}"
+    )
+    meter = tqdm.format_meter(
+        n=int(metrics["step"]),
+        total=int(metrics["max_steps"]),
+        elapsed=elapsed,
+        prefix=str(metrics.get("training_objective") or metrics.get("objective") or "train"),
+        ascii=True,
+        ncols=None,
+        postfix=postfix,
+    )
+    return f"tqdm_snapshot: {meter}"
+
+
 def progress_write(progress: Any, text: str) -> None:
-    if progress is not None:
+    if progress is not None and sys.stdout.isatty():
         progress.write(text)
     else:
-        print(text)
+        print(text, flush=True)
 
 
 def close_tqdm_progress(progress: Any) -> None:
