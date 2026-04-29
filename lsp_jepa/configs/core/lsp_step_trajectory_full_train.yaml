@@ -3,7 +3,7 @@ experiment:
   host: simcot
   backbone: coconut
   use_lsp_jepa: true
-  run_kind: pr12_mvp_full_seq_train
+  run_kind: lsp_core_step_trajectory_full_train
 
 runtime:
   model_id: tiny
@@ -27,12 +27,12 @@ data:
 
 training:
   script: lsp_jepa/scripts/train_lsp_jepa_core.py
-  output_dir: outputs/lsp_jepa/full_seq
-  metrics_path: outputs/lsp_jepa/full_seq/metrics.jsonl
-  summary_path: outputs/lsp_jepa/full_seq/summary.json
-  config_snapshot_path: outputs/lsp_jepa/full_seq/config.yaml
-  checkpoint_dir: outputs/lsp_jepa/full_seq/checkpoints
-  log_dir: outputs/lsp_jepa/full_seq/logs
+  output_dir: outputs/lsp_jepa/step_trajectory
+  metrics_path: outputs/lsp_jepa/step_trajectory/metrics.jsonl
+  summary_path: outputs/lsp_jepa/step_trajectory/summary.json
+  config_snapshot_path: outputs/lsp_jepa/step_trajectory/config.yaml
+  checkpoint_dir: outputs/lsp_jepa/step_trajectory/checkpoints
+  log_dir: outputs/lsp_jepa/step_trajectory/logs
   save_checkpoints: true
   max_steps: 468
   one_epoch_steps: 468
@@ -41,7 +41,11 @@ training:
   gradient_clip_norm: 1.0
   warmup_ratio: 0.03
   save_every: 100
+  save_every_epoch: true
+  keep_last_checkpoints: 1
+  keep_best_total_loss: true
   log_every: 10
+  tqdm_progress: true
   lr: 0.00005
   lr_note: Coconut GSM baseline lr is 1e-4; PR12 default is 0.5x.
   weight_decay: 0.0
@@ -55,7 +59,7 @@ teacher:
   target_layer: last_2
   target_pooling: step_last_token
   target_space: raw_hidden
-  target_position: final_valid_reasoning_step
+  target_position: all_valid_reasoning_step_boundaries
   exclude_answer_tokens: true
   exclude_answer_prefix: true
   reasoning_step_filter: exclude_answer_only_steps
@@ -69,12 +73,12 @@ student:
 
 lsp_objective:
   objective: lsp_state
-  type: state
+  type: step_trajectory
   state_offset: 0
   transition_weight: 0.0
 
 mapping:
-  strategy: sequence
+  strategy: one_to_one
   sparse_positions: [first, middle, final]
   attention_coverage_weight: 0.0
 
@@ -97,8 +101,14 @@ logging:
   log_target_leakage_checks: true
   log_host_losses: true
 
+eval:
+  every_epoch: true
+  split: test
+  limit_samples: 100
+
 optimization_contract:
-  no_step_level_training: true
+  no_step_level_training: false
+  step_trajectory_training: true
   no_adapter_expansion: true
   single_backward_per_batch: true
   ema_update_after_optimizer_step: true

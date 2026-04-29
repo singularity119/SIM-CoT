@@ -21,8 +21,8 @@ NUMERIC_FIELDS = [
     "latent_variance_mean", "latent_variance_min", "raw_latent_variance_mean",
     "pairwise_cosine_mean", "pairwise_cosine_max", "pairwise_cosine_min",
     "pairwise_l2_mean", "effective_rank", "ema_drift_l1", "teacher_delta_l1",
-    "student_grad_l1", "predictor_grad_l1", "student_base_grad_l1",
-    "valid_final_targets", "valid_teacher_targets",
+    "student_grad_l1", "student_base_grad_l1",
+    "valid_final_targets", "valid_teacher_targets", "valid_student_latents",
 ]
 
 
@@ -173,7 +173,7 @@ def make_report(args: argparse.Namespace) -> str:
         f"- optimizer config: lr `{cfg('training.lr')}`, weight_decay `{cfg('training.weight_decay')}`, gradient_clip_norm declared `{cfg('training.gradient_clip_norm')}`, warmup_ratio declared `{cfg('training.warmup_ratio')}`",
         f"- teacher: EMA decay `{cfg('teacher.ema_decay')}`, update_trainable_only `{cfg('teacher.update_trainable_only')}`, target_layer `{cfg('teacher.target_layer')}`, pooling `{cfg('teacher.target_pooling')}`, target_space `{cfg('teacher.target_space')}`",
         f"- teacher leakage controls: exclude_answer_tokens `{last.get('teacher_exclude_answer_tokens', cfg('teacher.exclude_answer_tokens'))}`, exclude_answer_prefix `{last.get('teacher_exclude_answer_prefix', cfg('teacher.exclude_answer_prefix'))}`, answer_leakage_ok `{last.get('answer_leakage_ok', 'not recorded')}`",
-        f"- student: latent_arch `{cfg('student.latent_arch')}`, latent steps `{cfg('student.num_latent_steps')}`, predictor_head_layers `{cfg('student.predictor_head_layers')}`, detach_between_steps `{cfg('student.detach_between_steps')}`",
+        f"- student: latent_arch `{cfg('student.latent_arch')}`, latent steps `{cfg('student.num_latent_steps')}`, target_space `{cfg('teacher.target_space')}`, detach_between_steps `{cfg('student.detach_between_steps')}`",
         f"- objective / mapping: `{last.get('objective', cfg('lsp_objective.objective'))}` with mapping `{last.get('mapping', cfg('mapping.strategy'))}`, target_position `{last.get('target_position', cfg('teacher.target_position'))}`",
         f"- losses: alignment `{cfg('loss.alignment')}`, lsp_weight `{last.get('lsp_weight', cfg('loss.align_weight'))}`, anti_collapse `{last.get('anti_collapse_type', cfg('loss.anti_collapse'))}` weight `{last.get('anti_collapse_weight', cfg('loss.anti_collapse_weight'))}`, host_answer_ce_weight `{last.get('host_answer_ce_weight', cfg('host_losses.host_answer_ce_weight'))}`",
         f"- disabled core contaminants: CODI distill weight `{cfg('host_losses.codi_distill_weight')}`, SIM-CoT decoder weight `{cfg('host_losses.simcot_decoder_weight')}`, intermediate CoT CE weight `{cfg('host_losses.intermediate_cot_ce_weight')}`", "",
@@ -203,7 +203,6 @@ def make_report(args: argparse.Namespace) -> str:
         "## Gradient Diagnostics", "",
         "- grad_norm: not recorded in PR13 metrics.",
         trend_line("student_grad_l1 substitute", stats["student_grad_l1"]),
-        trend_line("predictor_grad_l1 substitute", stats["predictor_grad_l1"]),
         trend_line("student_base_grad_l1 substitute", stats["student_base_grad_l1"]), "",
         "Interpretation: because `grad_norm` is absent, this report uses the recorded L1 gradient diagnostics as substitutes. They are finite and non-zero; no spike or missing-gradient anomaly is visible in these substitute fields.", "",
         "## Target And Failure Checks", "",

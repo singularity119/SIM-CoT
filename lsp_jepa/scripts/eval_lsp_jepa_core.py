@@ -28,7 +28,6 @@ if str(COCONUT_DIR) not in sys.path:
 
 from lsp_jepa.scripts.train_lsp_jepa_core import (  # noqa: E402
     Coconut,
-    LatentPredictor,
     MinimalTokenizer,
     TinyCausalLM,
     build_tokenizer_and_model,
@@ -37,7 +36,6 @@ from lsp_jepa.scripts.train_lsp_jepa_core import (  # noqa: E402
     load_hf_dataset_samples,
     load_samples_from_path,
     load_yaml_config,
-    model_hidden_size,
     resolve_device,
     resolve_repo_path,
 )
@@ -64,14 +62,12 @@ def main() -> None:
     samples = load_eval_samples(args)
     checkpoint = load_checkpoint(checkpoint_path)
     tokenizer, base_model = build_eval_tokenizer_and_model(samples, args)
-    student, predictor, load_status = build_and_load_student(
+    student, load_status = build_and_load_student(
         checkpoint,
         tokenizer=tokenizer,
         base_model=base_model,
         model_id=args.model_id,
         num_latent_steps=args.num_latent_steps,
-        predictor_head_layers=args.predictor_head_layers,
-        use_predictor_head=args.use_predictor_head,
         device=device,
     )
     load_status["tokenizer"] = {
@@ -82,7 +78,6 @@ def main() -> None:
         "eval_tokenizer_vocab_size": len(tokenizer),
     }
     student.eval()
-    predictor.eval()
 
     rows = []
     exact_matches = 0
@@ -194,8 +189,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-eval-samples", type=int, default=20)
     parser.add_argument("--expected-samples", type=int, default=1319)
     parser.add_argument("--num-latent-steps", type=int, default=4)
-    parser.add_argument("--use-predictor-head", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--predictor-head-layers", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--save-examples", type=int, default=5)
     args = parser.parse_args()
@@ -233,8 +226,6 @@ def apply_eval_config(args: argparse.Namespace, config: Mapping[str, Any], provi
     set_if_missing(args, provided, "hf_endpoint", config_get(config, "data.hf_endpoint"))
     set_if_missing(args, provided, "expected_samples", config_get(config, "data.expected_samples"))
     set_if_missing(args, provided, "num_latent_steps", config_get(config, "student.num_latent_steps"))
-    set_if_missing(args, provided, "use_predictor_head", config_get(config, "student.use_predictor_head"))
-    set_if_missing(args, provided, "predictor_head_layers", config_get(config, "student.predictor_head_layers"))
 
 
 def set_if_missing(
@@ -303,10 +294,8 @@ def build_and_load_student(
     base_model: torch.nn.Module,
     model_id: str,
     num_latent_steps: int,
-    predictor_head_layers: int,
-    use_predictor_head: bool,
     device: torch.device,
-) -> tuple[Coconut, LatentPredictor, dict[str, Any]]:
+) -> tuple[Coconut, dict[str, Any]]:
     state = checkpoint.get("student_base_causallm", {}) if isinstance(checkpoint, Mapping) else {}
     model_status = safe_load_state_dict(base_model, state)
     latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
@@ -314,17 +303,10 @@ def build_and_load_student(
     end_id = tokenizer.convert_tokens_to_ids("<|end-latent|>")
     student = Coconut(base_model, latent_id, start_id, end_id, tokenizer.eos_token_id)
 
-    predictor = LatentPredictor(
-        model_hidden_size(base_model),
-        layers=predictor_head_layers if use_predictor_head else 0,
-    )
-    predictor_status = safe_load_state_dict(predictor, checkpoint.get("predictor", {}))
     student.to(device)
-    predictor.to(device)
-    return student, predictor, {
+    return student, {
         "model_id": model_id,
         "student_base_causallm": model_status,
-        "predictor": predictor_status,
     }
 
 

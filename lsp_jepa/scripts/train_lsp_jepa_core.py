@@ -27,8 +27,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - tqdm is expected in the training env
+    tqdm = None
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 COCONUT_DIR = REPO_ROOT / "Coconut"
@@ -248,30 +254,6 @@ class TinyCausalLM(nn.Module):
         )
 
 
-class LatentPredictor(nn.Module):
-    """Small q_theta head for sequence-level student latent projection."""
-
-    def __init__(self, hidden_size: int, *, layers: int = 2) -> None:
-        super().__init__()
-        if layers <= 0:
-            self.net = nn.Identity()
-            return
-        modules: list[nn.Module] = []
-        for _ in range(max(layers - 1, 0)):
-            modules.extend(
-                [
-                    nn.LayerNorm(hidden_size),
-                    nn.Linear(hidden_size, hidden_size),
-                    nn.GELU(),
-                ]
-            )
-        modules.append(nn.Linear(hidden_size, hidden_size))
-        self.net = nn.Sequential(*modules)
-
-    def forward(self, states: torch.Tensor) -> torch.Tensor:
-        return self.net(states)
-
-
 class SampleDataset(Dataset[tuple[int, Sample]]):
     def __init__(self, samples: Sequence[Sample]) -> None:
         self.samples = list(samples)
@@ -285,8 +267,8 @@ class SampleDataset(Dataset[tuple[int, Sample]]):
 
 def main() -> None:
     args = parse_args()
-    if args.objective != "sequence":
-        raise ValueError("PR11-MVP only supports objective=sequence")
+    if args.objective not in {"sequence", "step_trajectory"}:
+        raise ValueError("--objective must be sequence or step_trajectory")
     if args.max_steps < 1:
         raise ValueError("--max-steps must be at least 1")
     if args.num_latent_steps < 1:
@@ -321,6 +303,9 @@ def main() -> None:
     tokenizer, base_model = build_tokenizer_and_model(args, samples)
     base_model.to(device)
     epoch_eval_samples = load_epoch_eval_samples(args) if args.eval_every > 0 else []
+    if isinstance(tokenizer, MinimalTokenizer) and epoch_eval_samples:
+        warm_tokenizer_vocab(tokenizer, list(epoch_eval_samples), args)
+        base_model.resize_token_embeddings(len(tokenizer))
 
     latent_id = tokenizer.convert_tokens_to_ids("<|latent|>")
     start_id = tokenizer.convert_tokens_to_ids("<|start-latent|>")
@@ -334,11 +319,6 @@ def main() -> None:
         tokenizer.eos_token_id,
     ).to(device)
     student.train()
-    predictor = LatentPredictor(
-        model_hidden_size(base_model),
-        layers=args.predictor_head_layers if args.use_predictor_head else 0,
-    ).to(device)
-    predictor.train()
 
     ema_teacher = EMATeacher.from_student(
         student.base_causallm,
@@ -347,7 +327,7 @@ def main() -> None:
         device=device,
     )
     optimizer = torch.optim.AdamW(
-        list(student.parameters()) + list(predictor.parameters()),
+        student.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
@@ -386,19 +366,13 @@ def main() -> None:
     adapter = CoconutLSPAdapter(latent_token_id=latent_id)
     metrics_history: list[dict[str, Any]] = []
     seen_sample_indices: set[int] = set()
+    best_total_loss: float | None = None
+    best_checkpoint_path: Path | None = None
+    progress = build_tqdm_progress(args)
 
     for train_step in range(1, args.max_steps + 1):
         batch_indices, batch_samples = next(batch_iter)
         seen_sample_indices.update(batch_indices)
-        student_batch = build_student_batch(
-            tokenizer,
-            batch_samples,
-            latent_id=latent_id,
-            start_id=start_id,
-            end_id=end_id,
-            num_latent_steps=args.num_latent_steps,
-            device=device,
-        )
         teacher_inputs = build_teacher_batch(tokenizer, batch_samples, args, device)
         answer_leakage_ok = validate_no_answer_leakage(
             batch_samples,
@@ -427,7 +401,17 @@ def main() -> None:
         )
         if not teacher_target_mask_nonempty:
             raise RuntimeError("teacher target mask is empty")
-        final_teacher = select_last_valid_target(teacher_targets)
+        latent_counts = latent_counts_for_objective(teacher_targets, args)
+        student_batch = build_student_batch(
+            tokenizer,
+            batch_samples,
+            latent_id=latent_id,
+            start_id=start_id,
+            end_id=end_id,
+            num_latent_steps=args.num_latent_steps,
+            latent_counts=latent_counts,
+            device=device,
+        )
 
         host_output = adapter.forward_student(
             student,
@@ -437,27 +421,35 @@ def main() -> None:
         latent_mask_nonempty = bool(host_output.latent_mask.any().detach().cpu().item())
         if not latent_mask_nonempty:
             raise RuntimeError("student latent mask is empty")
-        h_final, h_final_mask = select_last_valid_state(
+        aligned_student, aligned_teacher, alignment_mask = align_student_teacher_states(
             host_output.latent_states,
             host_output.latent_mask,
-        )
-        q_final = predictor(h_final)
-        z_final = final_teacher.target_states.to(device=h_final.device, dtype=h_final.dtype)
-        z_final_mask = final_teacher.target_mask.to(device=h_final.device)
-        final_mask = h_final_mask & z_final_mask
-
-        lsp_loss = compute_lsp_state_loss(
-            q_final,
-            z_final,
-            final_mask,
+            teacher_targets.target_states,
+            teacher_targets.target_mask,
+            objective=args.objective,
             alignment=args.alignment_loss,
         )
+
+        if args.objective == "step_trajectory":
+            lsp_loss = compute_step_trajectory_state_loss(
+                aligned_student,
+                aligned_teacher,
+                alignment_mask,
+                alignment=args.alignment_loss,
+            )
+        else:
+            lsp_loss = compute_lsp_state_loss(
+                aligned_student,
+                aligned_teacher,
+                alignment_mask,
+                alignment=args.alignment_loss,
+            )
         host_answer_ce = host_output.host_losses.get("host_answer_ce")
         if host_answer_ce is None:
             raise RuntimeError("Coconut host output did not provide host_answer_ce")
         anti_collapse_loss = compute_anti_collapse_loss(
-            q_final,
-            final_mask,
+            aligned_student,
+            alignment_mask,
             method=args.anti_collapse_type,
             weight=args.anti_collapse_weight,
         )
@@ -466,11 +458,11 @@ def main() -> None:
             + args.host_answer_ce_weight * host_answer_ce
             + anti_collapse_loss
         )
-        latent_variance = per_dim_variance(q_final, final_mask)
-        raw_latent_variance = per_dim_variance(h_final, final_mask)
-        pairwise = pairwise_cosine_summary(q_final, final_mask)
-        pairwise_l2_mean = pairwise_l2(q_final, final_mask)
-        latent_effective_rank = effective_rank(q_final, final_mask)
+        latent_variance = per_dim_variance(aligned_student, alignment_mask)
+        raw_latent_variance = per_dim_variance(host_output.latent_states, host_output.latent_mask)
+        pairwise = pairwise_cosine_summary(aligned_student, alignment_mask)
+        pairwise_l2_mean = pairwise_l2(aligned_student, alignment_mask)
+        latent_effective_rank = effective_rank(aligned_student, alignment_mask)
         answer_ce_terms = answer_ce_terms_in_total(args, host_answer_ce)
         answer_ce_double_count_ok = len(answer_ce_terms) <= 1
 
@@ -482,16 +474,15 @@ def main() -> None:
         validate_finite("pairwise_cosine_mean", pairwise["mean"])
         validate_finite("pairwise_l2_mean", pairwise_l2_mean)
         validate_finite("effective_rank", latent_effective_rank)
-        if not bool(final_mask.any().detach().cpu().item()):
-            raise RuntimeError("no valid final sequence alignment targets were found")
+        if not bool(alignment_mask.any().detach().cpu().item()):
+            raise RuntimeError("no valid LSP alignment targets were found")
         if not answer_ce_double_count_ok:
             raise RuntimeError("answer CE would be counted more than once in total loss")
 
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
         student_base_grad_l1 = grad_l1(student)
-        predictor_grad_l1 = grad_l1(predictor)
-        student_grad_l1 = student_base_grad_l1 + predictor_grad_l1
+        student_grad_l1 = student_base_grad_l1
         if student_grad_l1 <= 0.0 or not math.isfinite(student_grad_l1):
             raise RuntimeError("student parameters did not receive finite gradients")
         if student_base_grad_l1 <= 0.0 or not math.isfinite(student_base_grad_l1):
@@ -510,10 +501,29 @@ def main() -> None:
             step=train_step,
             checkpoint_dir=checkpoint_dir,
             student=student,
-            predictor=predictor,
             ema_teacher=ema_teacher,
             optimizer=optimizer,
         )
+        if checkpoint_path is not None:
+            total_loss_value = to_float(total_loss)
+            if args.keep_best_total_loss and (
+                best_total_loss is None or total_loss_value < best_total_loss
+            ):
+                best_total_loss = total_loss_value
+                best_checkpoint_path = checkpoint_path
+                write_json(
+                    checkpoint_dir / "best_total_loss.json",
+                    {
+                        "step": train_step,
+                        "total_loss": best_total_loss,
+                        "checkpoint_path": str(best_checkpoint_path),
+                    },
+                )
+            prune_old_checkpoints(
+                checkpoint_dir,
+                keep_last=args.keep_last_checkpoints,
+                keep_paths=[best_checkpoint_path] if best_checkpoint_path is not None else [],
+            )
         epoch_eval = maybe_run_epoch_eval(
             args,
             step=train_step,
@@ -532,9 +542,15 @@ def main() -> None:
             "experiment_mode": "core",
             "backbone": "coconut",
             "objective": "lsp_state",
-            "mapping": "sequence",
-            "target_position": "final_valid_reasoning_step",
-            "no_step_level_training": True,
+            "training_objective": args.objective,
+            "mapping": "one_to_one" if args.objective == "step_trajectory" else "sequence",
+            "target_position": (
+                "all_valid_reasoning_step_boundaries"
+                if args.objective == "step_trajectory"
+                else "final_valid_reasoning_step"
+            ),
+            "no_step_level_training": args.objective != "step_trajectory",
+            "step_trajectory_training": args.objective == "step_trajectory",
             "no_adapter_expansion": True,
             "sample_count": len(samples),
             "expected_samples": args.expected_samples,
@@ -548,6 +564,8 @@ def main() -> None:
             ),
             "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
             "checkpoint_keep_last": args.keep_last_checkpoints,
+            "best_total_loss": best_total_loss,
+            "best_checkpoint_path": str(best_checkpoint_path) if best_checkpoint_path is not None else None,
             "epoch_steps": args.epoch_steps,
             "epoch_index": epoch_index(train_step, args.epoch_steps),
             "unique_samples_seen": len(seen_sample_indices),
@@ -581,7 +599,6 @@ def main() -> None:
             "pairwise_l2_mean": to_float(pairwise_l2_mean),
             "student_grad_l1": student_grad_l1,
             "student_base_grad_l1": student_base_grad_l1,
-            "predictor_grad_l1": predictor_grad_l1,
             "teacher_grad_params": sum(
                 param.grad is not None for param in ema_teacher.parameters()
             ),
@@ -592,7 +609,15 @@ def main() -> None:
             "valid_teacher_targets": int(
                 teacher_targets.target_mask.sum().detach().cpu().item()
             ),
-            "valid_final_targets": int(final_mask.sum().detach().cpu().item()),
+            "valid_student_latents": int(
+                host_output.latent_mask.sum().detach().cpu().item()
+            ),
+            "valid_alignment_targets": int(alignment_mask.sum().detach().cpu().item()),
+            "valid_final_targets": int(alignment_mask.sum().detach().cpu().item()),
+            "student_latent_steps_max": int(host_output.latent_mask.shape[1]),
+            "teacher_steps_max": int(teacher_targets.target_mask.shape[1]),
+            "student_latent_counts": tensor_to_int_list(host_output.latent_mask.sum(dim=1)),
+            "teacher_target_counts": tensor_to_int_list(teacher_targets.target_mask.sum(dim=1)),
             "teacher_input_ids_shape": list(teacher_inputs["teacher_input_ids"].shape),
             "final_valid_step_position": tensor_to_int_list(
                 teacher_inputs["final_valid_step_position"]
@@ -612,9 +637,11 @@ def main() -> None:
             }
         append_metrics(metrics_path, metrics)
         metrics_history.append(metrics)
+        update_tqdm_progress(progress, metrics)
         if should_log_step(args, train_step):
-            print(json.dumps(metrics, sort_keys=True))
+            progress_write(progress, json.dumps(metrics, sort_keys=True))
 
+    close_tqdm_progress(progress)
     summary = build_summary(
         metrics_history,
         args=args,
@@ -665,8 +692,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alignment-loss", default="normalized_mse")
     parser.add_argument("--anti-collapse-type", default="variance")
     parser.add_argument("--anti-collapse-weight", type=float, default=0.01)
-    parser.add_argument("--use-predictor-head", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--predictor-head-layers", type=int, default=2)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--metrics-path", default=None)
     parser.add_argument("--summary-path", default=None)
@@ -715,6 +740,12 @@ def parse_args() -> argparse.Namespace:
         help="0 keeps all checkpoints; N keeps only the latest N step_*.pt files.",
     )
     parser.add_argument(
+        "--keep-best-total-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep the epoch checkpoint with the lowest observed total_loss.",
+    )
+    parser.add_argument(
         "--eval-every",
         type=int,
         default=0,
@@ -736,6 +767,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-limit-samples", type=int, default=20)
     parser.add_argument("--eval-max-new-tokens", type=int, default=32)
     parser.add_argument("--eval-save-examples", type=int, default=5)
+    parser.add_argument("--tqdm-progress", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--drop-last", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
@@ -793,6 +825,8 @@ def apply_config(
     set_from_config(args, provided_flags, "save_every", config_get(config, "training.save_every"))
     set_from_config(args, provided_flags, "save_every_epoch", config_get(config, "training.save_every_epoch"))
     set_from_config(args, provided_flags, "keep_last_checkpoints", config_get(config, "training.keep_last_checkpoints"))
+    set_from_config(args, provided_flags, "keep_best_total_loss", config_get(config, "training.keep_best_total_loss"))
+    set_from_config(args, provided_flags, "tqdm_progress", config_get(config, "training.tqdm_progress"))
     set_from_config(args, provided_flags, "eval_every", config_get(config, "eval.every_steps"))
     set_from_config(args, provided_flags, "eval_every_epoch", config_get(config, "eval.every_epoch"))
     set_from_config(args, provided_flags, "eval_output_dir", config_get(config, "eval.output_dir"))
@@ -854,16 +888,13 @@ def apply_config(
     if "include_answer_prefix" not in provided_flags and exclude_answer_prefix is not None:
         args.include_answer_prefix = not bool(exclude_answer_prefix)
     set_from_config(args, provided_flags, "num_latent_steps", config_get(config, "student.num_latent_steps"))
-    set_from_config(args, provided_flags, "use_predictor_head", config_get(config, "student.use_predictor_head"))
-    set_from_config(
-        args,
-        provided_flags,
-        "predictor_head_layers",
-        config_get(config, "student.predictor_head_layers"),
-    )
     objective_type = config_get(config, "lsp_objective.type")
-    if "objective" not in provided_flags and objective_type == "state":
-        args.objective = "sequence"
+    mapping_strategy = config_get(config, "mapping.strategy")
+    if "objective" not in provided_flags:
+        if objective_type == "step_trajectory" or mapping_strategy == "one_to_one":
+            args.objective = "step_trajectory"
+        elif objective_type == "state":
+            args.objective = "sequence"
     set_from_config(args, provided_flags, "alignment_loss", config_get(config, "loss.alignment"))
     set_from_config(args, provided_flags, "lsp_weight", config_get(config, "loss.align_weight"))
     anti_collapse = config_get(config, "loss.anti_collapse")
@@ -1375,6 +1406,104 @@ def epoch_index(step: int, epoch_steps: int) -> int:
     return math.ceil(step / epoch_steps)
 
 
+def latent_counts_for_objective(
+    teacher_targets: TeacherTargetBatch,
+    args: argparse.Namespace,
+) -> list[int]:
+    if args.objective == "step_trajectory":
+        counts = teacher_targets.target_mask.to(dtype=torch.long).sum(dim=1)
+        return [max(1, int(count.detach().cpu().item())) for count in counts]
+    return [int(args.num_latent_steps)] * int(teacher_targets.target_mask.shape[0])
+
+
+def align_student_teacher_states(
+    student_states: torch.Tensor,
+    student_mask: torch.Tensor,
+    teacher_states: torch.Tensor,
+    teacher_mask: torch.Tensor,
+    *,
+    objective: str,
+    alignment: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del alignment
+    teacher_states = teacher_states.to(device=student_states.device, dtype=student_states.dtype).detach()
+    teacher_mask = teacher_mask.to(device=student_states.device, dtype=torch.bool)
+    student_mask = student_mask.to(device=student_states.device, dtype=torch.bool)
+    if objective == "sequence":
+        h_final, h_final_mask = select_last_valid_state(student_states, student_mask)
+        z_final, z_final_mask = select_last_valid_state(teacher_states, teacher_mask)
+        return h_final, z_final, h_final_mask & z_final_mask
+    if objective != "step_trajectory":
+        raise ValueError(f"unsupported objective: {objective}")
+    steps = min(student_states.shape[1], teacher_states.shape[1])
+    aligned_student = student_states[:, :steps, :]
+    aligned_teacher = teacher_states[:, :steps, :]
+    aligned_mask = student_mask[:, :steps] & teacher_mask[:, :steps]
+    return aligned_student, aligned_teacher, aligned_mask
+
+
+def compute_step_trajectory_state_loss(
+    student_states: torch.Tensor,
+    teacher_states: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    alignment: str,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if alignment not in {"normalized_mse", "masked_normalized_mse"}:
+        return compute_lsp_state_loss(student_states, teacher_states, mask, alignment=alignment)
+    if student_states.shape != teacher_states.shape:
+        raise ValueError("student_states and teacher_states must have identical shape")
+    mask = mask.to(device=student_states.device, dtype=torch.bool)
+    student_norm = F.normalize(student_states, p=2, dim=-1, eps=eps)
+    teacher_norm = F.normalize(teacher_states.detach(), p=2, dim=-1, eps=eps)
+    step_loss = (student_norm - teacher_norm).square().mean(dim=-1)
+    safe_step_loss = torch.where(mask, step_loss, torch.zeros_like(step_loss))
+    valid_counts = mask.to(dtype=step_loss.dtype).sum(dim=1)
+    per_sample = safe_step_loss.sum(dim=1) / valid_counts.clamp_min(1.0)
+    valid_samples = valid_counts.gt(0)
+    if not bool(valid_samples.any().detach().cpu().item()):
+        return student_states.sum() * 0.0
+    return per_sample[valid_samples].mean()
+
+
+def build_tqdm_progress(args: argparse.Namespace) -> Any:
+    if not args.tqdm_progress or tqdm is None:
+        return None
+    return tqdm(
+        total=args.max_steps,
+        desc=args.objective,
+        dynamic_ncols=True,
+        mininterval=1.0,
+        file=sys.stdout,
+    )
+
+
+def update_tqdm_progress(progress: Any, metrics: Mapping[str, Any]) -> None:
+    if progress is None:
+        return
+    progress.set_postfix(
+        total_loss=f"{float(metrics['total_loss']):.6f}",
+        lsp_loss=f"{float(metrics['lsp_loss']):.6f}",
+        host_answer_ce=f"{float(metrics['host_answer_ce']):.6f}",
+        latent_var=f"{float(metrics['latent_variance_mean']):.4g}",
+        refresh=False,
+    )
+    progress.update(1)
+
+
+def progress_write(progress: Any, text: str) -> None:
+    if progress is not None:
+        progress.write(text)
+    else:
+        print(text)
+
+
+def close_tqdm_progress(progress: Any) -> None:
+    if progress is not None:
+        progress.close()
+
+
 def should_log_step(args: argparse.Namespace, step: int) -> bool:
     return step == 1 or step == args.max_steps or (args.log_every > 0 and step % args.log_every == 0)
 
@@ -1395,7 +1524,6 @@ def maybe_save_checkpoint(
     step: int,
     checkpoint_dir: Path,
     student: nn.Module,
-    predictor: nn.Module,
     ema_teacher: EMATeacher,
     optimizer: torch.optim.Optimizer,
 ) -> Path | None:
@@ -1410,11 +1538,11 @@ def maybe_save_checkpoint(
         {
             "step": step,
             "student_base_causallm": student.base_causallm.state_dict(),
-            "predictor": predictor.state_dict(),
             "ema_teacher": ema_teacher.teacher_model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": {
                 "max_steps": args.max_steps,
+                "objective": args.objective,
                 "ema_decay": args.ema_decay,
                 "lsp_weight": args.lsp_weight,
                 "host_answer_ce_weight": args.host_answer_ce_weight,
@@ -1424,18 +1552,26 @@ def maybe_save_checkpoint(
         },
         path,
     )
-    prune_old_checkpoints(checkpoint_dir, keep_last=args.keep_last_checkpoints)
     return path
 
 
-def prune_old_checkpoints(checkpoint_dir: Path, *, keep_last: int) -> None:
+def prune_old_checkpoints(
+    checkpoint_dir: Path,
+    *,
+    keep_last: int,
+    keep_paths: Sequence[Path] = (),
+) -> None:
     if keep_last <= 0:
         return
     checkpoints = sorted(
         checkpoint_dir.glob("step_*.pt"),
         key=lambda path: (checkpoint_step_number(path), path.name),
     )
-    for old_path in checkpoints[:-keep_last]:
+    keep = {path.resolve() for path in keep_paths if path is not None and path.exists()}
+    keep.update(path.resolve() for path in checkpoints[-keep_last:])
+    for old_path in checkpoints:
+        if old_path.resolve() in keep:
+            continue
         old_path.unlink(missing_ok=True)
 
 
@@ -1731,7 +1867,11 @@ def build_config_snapshot(
             "host": "simcot",
             "backbone": "coconut",
             "use_lsp_jepa": True,
-            "run_kind": "PR11-MVP full-data sequence-level debug train",
+            "run_kind": (
+                "LSP-JEPA-Core StepTrajectory train"
+                if args.objective == "step_trajectory"
+                else "LSP-JEPA-Core SequenceFinal train"
+            ),
         },
         "teacher": {
             "ema_decay": args.ema_decay,
@@ -1739,28 +1879,30 @@ def build_config_snapshot(
             "output_hidden_states": True,
             "target_layer": args.target_layer,
             "target_pooling": "step_last_token",
-            "target_space": "projected_hidden",
+            "target_space": "raw_hidden",
             "exclude_answer_tokens": not args.include_answer_tokens,
             "exclude_answer_prefix": not args.include_answer_prefix,
             "reasoning_step_filter": args.reasoning_step_filter,
-            "target_position": "final_valid_reasoning_step",
+            "target_position": (
+                "all_valid_reasoning_step_boundaries"
+                if args.objective == "step_trajectory"
+                else "final_valid_reasoning_step"
+            ),
         },
         "student": {
             "latent_arch": "latent_tokens",
             "num_latent_steps": args.num_latent_steps,
             "latent_dim": None,
-            "use_predictor_head": args.use_predictor_head,
-            "predictor_head_layers": args.predictor_head_layers,
             "normalize_latents": True,
             "detach_between_steps": False,
         },
         "lsp_objective": {
-            "type": "state",
+            "type": "step_trajectory" if args.objective == "step_trajectory" else "state",
             "state_offset": 0,
             "transition_weight": 0.0,
         },
         "mapping": {
-            "strategy": "sequence",
+            "strategy": "one_to_one" if args.objective == "step_trajectory" else "sequence",
             "sparse_positions": ["first", "middle", "final"],
             "attention_coverage_weight": 0.0,
         },
@@ -1790,11 +1932,13 @@ def build_config_snapshot(
             "save_every": args.save_every,
             "save_every_epoch": args.save_every_epoch,
             "keep_last_checkpoints": args.keep_last_checkpoints,
+            "keep_best_total_loss": args.keep_best_total_loss,
             "log_every": args.log_every,
             "save_checkpoints": args.save_checkpoints,
             "single_backward_per_batch": True,
             "ema_update_after_optimizer_step": True,
-            "no_step_level_training": True,
+            "no_step_level_training": args.objective != "step_trajectory",
+            "step_trajectory_training": args.objective == "step_trajectory",
             "no_adapter_expansion": True,
         },
         "data": {
@@ -1930,7 +2074,11 @@ def build_summary(
         "pairwise_cosine_not_long_near_one": pairwise_cosine_not_long_near_one,
         "teacher_no_grad": teacher_no_grad,
         "answer_leakage_ok": answer_leakage_ok,
-        "no_step_level_training": all(bool(item["no_step_level_training"]) for item in metrics_history),
+        "training_mode_matches_objective": (
+            all(bool(item.get("step_trajectory_training")) for item in metrics_history)
+            if args.objective == "step_trajectory"
+            else all(bool(item["no_step_level_training"]) for item in metrics_history)
+        ),
     }
     acceptance["passed"] = all(acceptance.values())
     return {
@@ -1955,6 +2103,8 @@ def build_summary(
             "checkpoint_dir": str(resolve_metrics_path(args.checkpoint_dir)),
             "last_checkpoint_path": last.get("checkpoint_path"),
             "checkpoint_keep_last": args.keep_last_checkpoints,
+            "best_total_loss": last.get("best_total_loss"),
+            "best_checkpoint_path": last.get("best_checkpoint_path"),
             "epoch_steps": args.epoch_steps,
         },
         "loss_curve": {
@@ -1990,7 +2140,6 @@ def build_summary(
         "grad_contract": {
             "student_grad_l1_last": float(last["student_grad_l1"]),
             "student_base_grad_l1_last": float(last["student_base_grad_l1"]),
-            "predictor_grad_l1_last": float(last["predictor_grad_l1"]),
             "teacher_grad_params_last": int(last["teacher_grad_params"]),
             "ema_drift_l1_last": float(last["ema_drift_l1"]),
         },
@@ -2160,23 +2309,29 @@ def build_student_batch(
     start_id: int,
     end_id: int,
     num_latent_steps: int,
+    latent_counts: Sequence[int] | None = None,
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
     rows = []
     label_rows = []
     first_latent_positions = []
-    for sample in samples:
+    if latent_counts is None:
+        latent_counts = [num_latent_steps] * len(samples)
+    if len(latent_counts) != len(samples):
+        raise ValueError("latent_counts must match batch size")
+    for sample, latent_count in zip(samples, latent_counts, strict=True):
+        latent_count = max(1, int(latent_count))
         question_ids = list(tokenizer.encode(sample.question + "\n", add_special_tokens=True))
         answer_ids = list(tokenizer.encode("### " + sample.answer, add_special_tokens=False))
         answer_ids.append(int(tokenizer.eos_token_id))
         input_ids = (
             question_ids
             + [start_id]
-            + [latent_id] * num_latent_steps
+            + [latent_id] * latent_count
             + [end_id]
             + answer_ids
         )
-        labels = [-100] * (len(question_ids) + num_latent_steps + 2) + answer_ids
+        labels = [-100] * (len(question_ids) + latent_count + 2) + answer_ids
         rows.append(input_ids)
         label_rows.append(labels)
         first_latent_positions.append(input_ids.index(latent_id))

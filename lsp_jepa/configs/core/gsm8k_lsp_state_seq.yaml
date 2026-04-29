@@ -10,7 +10,7 @@ teacher:
   output_hidden_states: true
   target_layer: last_2
   target_pooling: step_last_token
-  target_space: projected_hidden
+  target_space: raw_hidden
   exclude_answer_tokens: true
   exclude_answer_prefix: true
   reasoning_step_filter: exclude_answer_only_steps
@@ -19,8 +19,6 @@ student:
   latent_arch: latent_tokens
   num_latent_steps: 4
   latent_dim: null
-  use_predictor_head: true
-  predictor_head_layers: 2
   normalize_latents: true
   detach_between_steps: false
 

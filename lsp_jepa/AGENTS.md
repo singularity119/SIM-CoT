@@ -13,9 +13,9 @@ SIM-CoT 可以用于 datasets、tokenization、prompts、baseline implementation
 ```text
 Teacher target:   z_i = target_head_ema(EMA_Model(Q + CoT_<=i))[step_i_boundary]  # no grad
 Student rollout:  h_i = student(Q).latent_states[i]
-Main loss:        LSP-State = Align(q_theta(h_i), stop_grad(z_i))
+Main loss:        LSP-State = Align(h_i, stop_grad(z_i))
 Total loss:       lambda_lsp * LSP-State
-                + beta * AntiCollapse(projected_latents)
+                + beta * AntiCollapse(student_latents)
                 + optional eta * AnswerReadoutCE
                 + optional host_backbone_losses only in adapter experiments
 EMA update:       theta_ema <- decay * theta_ema + (1 - decay) * theta_student
@@ -41,7 +41,6 @@ lsp_jepa/
     ema_teacher.py              # EMA model manager
     target_builder.py           # Q+CoT prefix construction 与 step-boundary target extraction
     latent_interface.py         # latent states、masks、answer logits、host losses 的 dataclasses/protocols
-    predictor_heads.py          # student q_theta heads 与 optional target heads
     losses.py                   # normalized MSE、cosine、SmoothL1、InfoNCE
     mapping.py                  # sequence、one_to_one、sparse、uniform、attention、soft_dtw
     anti_collapse.py            # SIGReg、VICReg、variance/covariance fallbacks
@@ -185,7 +184,7 @@ teacher:
   output_hidden_states: true
   target_layer: last_2    # embedding only allowed in explicit ablations
   target_pooling: step_last_token   # step_last_token | step_mean | prefix_last_token
-  target_space: projected_hidden    # raw_hidden | projected_hidden
+  target_space: raw_hidden          # default Core target space
   exclude_answer_tokens: true
   exclude_answer_prefix: true
   reasoning_step_filter: exclude_answer_only_steps
@@ -194,8 +193,6 @@ student:
   latent_arch: latent_tokens        # latent_tokens | recurrent | looped
   num_latent_steps: 4
   latent_dim: null                  # null means model hidden size
-  use_predictor_head: true
-  predictor_head_layers: 2
   normalize_latents: true
   detach_between_steps: false       # true only for explicit ablation
 
@@ -299,7 +296,7 @@ loss = align(pred_states, target_states, pred_mask, target_mask, mapping_strateg
 默认 alignment：
 
 ```python
-pred = normalize(predictor_head(student_states))
+pred = normalize(student_states)
 target = normalize(stop_grad(teacher_target_states))
 loss = masked_mse(pred, target, mask)
 ```
@@ -423,7 +420,7 @@ Ablations：
 - target pooling：`step_last_token`、`step_mean`、`prefix_last_token`。
 - alignment loss：`mse`、`normalized_mse`、`cosine`、`smooth_l1`、`infonce`。
 - anti-collapse：`none`、`sigreg`、`vicreg`、variance-only、covariance-only。
-- latent predictor：`latent_tokens`、`recurrent`、`looped`。
+- latent rollout architecture：`latent_tokens`、`recurrent`、`looped`。
 - number of latent steps：`1`、`2`、`4`、`8`、`16`。
 - leakage：answer tokens 默认 excluded；只在命名 leakage ablations 中 include。
 - objective：`state`、`transition`、`state_plus_transition`、`skip`。

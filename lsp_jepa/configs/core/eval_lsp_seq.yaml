@@ -33,8 +33,6 @@ student:
   latent_arch: latent_tokens
   num_latent_steps: 4
   latent_dim: null
-  use_predictor_head: true
-  predictor_head_layers: 2
   normalize_latents: true
   detach_between_steps: false
 
