@@ -16,6 +16,7 @@ import math
 import os
 import re
 import sys
+import time
 import types
 import urllib.error
 import urllib.parse
@@ -1473,7 +1474,7 @@ def compute_step_trajectory_state_loss(
 def build_tqdm_progress(args: argparse.Namespace) -> Any:
     if not args.tqdm_progress or tqdm is None:
         return None
-    return tqdm(
+    progress = tqdm(
         total=args.max_steps,
         desc=args.objective,
         dynamic_ncols=sys.stdout.isatty(),
@@ -1482,6 +1483,8 @@ def build_tqdm_progress(args: argparse.Namespace) -> Any:
         ascii=not sys.stdout.isatty(),
         disable=not sys.stdout.isatty(),
     )
+    progress._lsp_jepa_log_start_time = time.monotonic()
+    return progress
 
 
 def update_tqdm_progress(progress: Any, metrics: Mapping[str, Any]) -> None:
@@ -1500,7 +1503,11 @@ def update_tqdm_progress(progress: Any, metrics: Mapping[str, Any]) -> None:
 def build_tqdm_log_line(progress: Any, metrics: Mapping[str, Any]) -> str | None:
     if progress is None or tqdm is None:
         return None
-    elapsed = float(getattr(progress, "format_dict", {}).get("elapsed") or 0.0)
+    start_time = getattr(progress, "_lsp_jepa_log_start_time", None)
+    if start_time is not None:
+        elapsed = max(1e-9, time.monotonic() - float(start_time))
+    else:
+        elapsed = float(getattr(progress, "format_dict", {}).get("elapsed") or 0.0)
     postfix = (
         f"total_loss={float(metrics['total_loss']):.6f}, "
         f"lsp_loss={float(metrics['lsp_loss']):.6f}, "
