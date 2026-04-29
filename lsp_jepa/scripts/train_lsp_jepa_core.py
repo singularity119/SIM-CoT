@@ -643,7 +643,8 @@ def main() -> None:
             tqdm_log_line = build_tqdm_log_line(progress, metrics)
             if tqdm_log_line is not None:
                 progress_write(progress, tqdm_log_line)
-            progress_write(progress, json.dumps(metrics, sort_keys=True))
+            if should_log_json(args, train_step):
+                progress_write(progress, json.dumps(metrics, sort_keys=True))
 
     close_tqdm_progress(progress)
     summary = build_summary(
@@ -773,6 +774,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-save-examples", type=int, default=5)
     parser.add_argument("--tqdm-progress", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument(
+        "--console-json-every",
+        type=int,
+        default=0,
+        help="Print full metrics JSON to stdout every N steps; 0 keeps JSON only in metrics.jsonl.",
+    )
     parser.add_argument("--drop-last", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-answer-tokens", action="store_true")
@@ -831,6 +838,7 @@ def apply_config(
     set_from_config(args, provided_flags, "keep_last_checkpoints", config_get(config, "training.keep_last_checkpoints"))
     set_from_config(args, provided_flags, "keep_best_total_loss", config_get(config, "training.keep_best_total_loss"))
     set_from_config(args, provided_flags, "tqdm_progress", config_get(config, "training.tqdm_progress"))
+    set_from_config(args, provided_flags, "console_json_every", config_get(config, "logging.console_json_every"))
     set_from_config(args, provided_flags, "eval_every", config_get(config, "eval.every_steps"))
     set_from_config(args, provided_flags, "eval_every_epoch", config_get(config, "eval.every_epoch"))
     set_from_config(args, provided_flags, "eval_output_dir", config_get(config, "eval.output_dir"))
@@ -1520,11 +1528,11 @@ def build_tqdm_log_line(progress: Any, metrics: Mapping[str, Any]) -> str | None
         total=int(metrics["max_steps"]),
         elapsed=elapsed,
         prefix=str(metrics.get("training_objective") or metrics.get("objective") or "train"),
-        ascii=True,
+        ascii=False,
         ncols=None,
         postfix=postfix,
     )
-    return f"tqdm_snapshot: {meter}"
+    return meter
 
 
 def progress_write(progress: Any, text: str) -> None:
@@ -1541,6 +1549,14 @@ def close_tqdm_progress(progress: Any) -> None:
 
 def should_log_step(args: argparse.Namespace, step: int) -> bool:
     return step == 1 or step == args.max_steps or (args.log_every > 0 and step % args.log_every == 0)
+
+
+def should_log_json(args: argparse.Namespace, step: int) -> bool:
+    return args.console_json_every > 0 and (
+        step == 1
+        or step == args.max_steps
+        or step % args.console_json_every == 0
+    )
 
 
 def model_hidden_size(model: nn.Module) -> int:
@@ -1969,6 +1985,7 @@ def build_config_snapshot(
             "keep_last_checkpoints": args.keep_last_checkpoints,
             "keep_best_total_loss": args.keep_best_total_loss,
             "log_every": args.log_every,
+            "console_json_every": args.console_json_every,
             "save_checkpoints": args.save_checkpoints,
             "single_backward_per_batch": True,
             "ema_update_after_optimizer_step": True,

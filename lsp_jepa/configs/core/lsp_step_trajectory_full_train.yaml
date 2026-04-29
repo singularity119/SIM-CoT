@@ -44,7 +44,7 @@ training:
   save_every_epoch: true
   keep_last_checkpoints: 1
   keep_best_total_loss: true
-  log_every: 10
+  log_every: 100
   tqdm_progress: true
   lr: 0.00005
   lr_note: Coconut GSM baseline lr is 1e-4; PR12 default is 0.5x.
@@ -100,6 +100,7 @@ logging:
   log_alignment_matrices: false
   log_target_leakage_checks: true
   log_host_losses: true
+  console_json_every: 0
 
 eval:
   every_epoch: true
