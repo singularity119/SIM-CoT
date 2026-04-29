@@ -266,7 +266,6 @@ print(json.dumps({"config_gate": "passed", "readiness_gate": "passed", **checks}
 PY
 
 RUN_LOG="$LOG_DIR/run_$(date -u +%Y%m%dT%H%M%SZ)_max_steps_${MAX_STEPS}.log"
-ln -sfn "$OUTPUT_DIR" "${OUTPUT_ROOT%/}/latest_run"
 ln -sfn "$RUN_LOG" "${OUTPUT_ROOT%/}/latest_main.log"
 CMD=(
   python lsp_jepa/scripts/train_lsp_jepa_core.py

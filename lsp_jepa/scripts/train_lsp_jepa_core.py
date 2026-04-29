@@ -1516,16 +1516,31 @@ def build_tqdm_log_line(progress: Any, metrics: Mapping[str, Any]) -> str | None
         elapsed = max(1e-9, time.monotonic() - float(start_time))
     else:
         elapsed = float(getattr(progress, "format_dict", {}).get("elapsed") or 0.0)
+    step = int(metrics["step"])
+    max_steps = int(metrics["max_steps"])
+    epoch_steps = max(1, int(metrics.get("epoch_steps") or max_steps))
+    epoch_index = int(metrics.get("epoch_index") or ((step - 1) // epoch_steps + 1))
+    total_epochs = max(1, math.ceil(max_steps / epoch_steps))
+    epoch_step = ((step - 1) % epoch_steps) + 1
+    if step >= max_steps and max_steps % epoch_steps:
+        epoch_step = max_steps % epoch_steps
+    steps_per_second = step / elapsed if elapsed > 0.0 else 0.0
+    epoch_eta = "?"
+    if steps_per_second > 0.0:
+        epoch_remaining = max(0, epoch_steps - epoch_step)
+        epoch_eta = tqdm.format_interval(epoch_remaining / steps_per_second)
     postfix = (
         f"total_loss={float(metrics['total_loss']):.6f}, "
         f"lsp_loss={float(metrics['lsp_loss']):.6f}, "
         f"host_answer_ce={float(metrics['host_answer_ce']):.6f}, "
         f"latent_var={float(metrics['latent_variance_mean']):.4g}, "
-        f"epoch={int(metrics.get('epoch_index', 0))}"
+        f"epoch={epoch_index}/{total_epochs}, "
+        f"epoch_step={epoch_step}/{epoch_steps}, "
+        f"epoch_eta={epoch_eta}"
     )
     meter = tqdm.format_meter(
-        n=int(metrics["step"]),
-        total=int(metrics["max_steps"]),
+        n=step,
+        total=max_steps,
         elapsed=elapsed,
         prefix=str(metrics.get("training_objective") or metrics.get("objective") or "train"),
         ascii=False,
