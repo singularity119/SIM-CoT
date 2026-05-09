@@ -87,6 +87,74 @@ lsp_jepa/
     test_core_mode_zero_host_losses.py
 ```
 
+## 核心公式
+
+训练样本：
+
+```
+(Q, CoT steps C1...CK, Answer A)
+```
+
+EMA teacher trajectory：
+
+```
+z_i = EMA_Model(Q + C_<=i) 在第 i 个 CoT step boundary 的 contextual hidden state
+```
+
+Student latent rollout：
+
+```
+h_i = Student(Q) 完成第 i 次 latent reasoning update 后的 latent state
+```
+
+默认主损失：
+
+$$
+\mathcal{L}_{LSP}=\sum_i d\left(h_i,\mathrm{sg}(z_i)\right)
+$$
+
+完整训练目标：
+
+$$
+\mathcal{L}_{total}=\lambda_{lsp}\mathcal{L}{LSP}+\lambda{ans}\mathcal{L}{ans}^{CE}+\beta\mathcal{L}{anti-collapse}+\mathcal{L}_{backbone}
+$$
+
+其中：
+
+```
+h_i:
+  student latent rollout 在第 i 次 latent reasoning update 后得到的 latent state
+
+z_i:
+  EMA teacher 看到 Q + C_<=i 后，在第 i 个 CoT step boundary 的 contextual hidden state
+
+sg:
+  stop-gradient
+
+L_ans:
+  optional final answer CE
+
+L_backbone:
+  optional Coconut / CoDI / SIM-CoT 原始损失，仅 adapter 实验使用
+```
+
+默认 Core 方法不使用 student-side predictor / projection head，也不使用
+teacher-side target projection head。主对齐是直接的：
+
+```
+h_i ↔ stop_grad(z_i)
+```
+
+如果后续为了 ablation 重新加入 projection head，必须显式命名为
+`projection_head_ablation`，不能作为默认主方法。
+
+EMA 更新：
+
+$$
+\bar{\theta}\leftarrow\alpha \bar{\theta}+(1-\alpha)\theta
+$$
+
+
 ## 实验模式
 
 每个 run 都必须声明 mode。

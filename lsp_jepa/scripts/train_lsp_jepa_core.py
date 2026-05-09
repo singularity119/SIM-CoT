@@ -278,6 +278,8 @@ def main() -> None:
         raise ValueError("--batch-size must be at least 1")
     if args.min_samples < 1:
         raise ValueError("--min-samples must be at least 1")
+    if args.effective_rank_every < 0:
+        raise ValueError("--effective-rank-every must be non-negative")
 
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
@@ -463,7 +465,15 @@ def main() -> None:
         raw_latent_variance = per_dim_variance(host_output.latent_states, host_output.latent_mask)
         pairwise = pairwise_cosine_summary(aligned_student, alignment_mask)
         pairwise_l2_mean = pairwise_l2(aligned_student, alignment_mask)
-        latent_effective_rank = effective_rank(aligned_student, alignment_mask)
+        (
+            latent_effective_rank,
+            latent_effective_rank_status,
+            latent_effective_rank_error,
+        ) = effective_rank_diagnostic(
+            aligned_student,
+            alignment_mask,
+            compute=should_compute_effective_rank(args, train_step),
+        )
         answer_ce_terms = answer_ce_terms_in_total(args, host_answer_ce)
         answer_ce_double_count_ok = len(answer_ce_terms) <= 1
 
@@ -474,7 +484,6 @@ def main() -> None:
         validate_finite("latent_variance_mean", latent_variance["mean"])
         validate_finite("pairwise_cosine_mean", pairwise["mean"])
         validate_finite("pairwise_l2_mean", pairwise_l2_mean)
-        validate_finite("effective_rank", latent_effective_rank)
         if not bool(alignment_mask.any().detach().cpu().item()):
             raise RuntimeError("no valid LSP alignment targets were found")
         if not answer_ce_double_count_ok:
@@ -590,7 +599,14 @@ def main() -> None:
             "latent_variance_min": to_float(latent_variance["min"]),
             "latent_variance_max": to_float(latent_variance["max"]),
             "raw_latent_variance_mean": to_float(raw_latent_variance["mean"]),
-            "effective_rank": to_float(latent_effective_rank),
+            "effective_rank": (
+                to_float(latent_effective_rank)
+                if latent_effective_rank is not None
+                else None
+            ),
+            "effective_rank_status": latent_effective_rank_status,
+            "effective_rank_error": latent_effective_rank_error,
+            "effective_rank_every": args.effective_rank_every,
             "pairwise_cosine": to_float(pairwise["mean"]),
             "pairwise_cosine_mean": to_float(pairwise["mean"]),
             "pairwise_cosine_min": to_float(pairwise["min"]),
@@ -731,6 +747,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loss-stability-ratio", type=float, default=10.0)
     parser.add_argument("--collapse-eps", type=float, default=1e-10)
     parser.add_argument("--pairwise-cosine-fail-threshold", type=float, default=0.999)
+    parser.add_argument(
+        "--effective-rank-every",
+        type=int,
+        default=0,
+        help=(
+            "Compute effective-rank diagnostics every N steps; "
+            "0 skips online computation to avoid eigensolver failures."
+        ),
+    )
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument(
         "--save-every-epoch",
@@ -839,6 +864,8 @@ def apply_config(
     set_from_config(args, provided_flags, "keep_best_total_loss", config_get(config, "training.keep_best_total_loss"))
     set_from_config(args, provided_flags, "tqdm_progress", config_get(config, "training.tqdm_progress"))
     set_from_config(args, provided_flags, "console_json_every", config_get(config, "logging.console_json_every"))
+    set_from_config(args, provided_flags, "effective_rank_every", config_get(config, "logging.effective_rank_every"))
+    set_from_config(args, provided_flags, "effective_rank_every", config_get(config, "training.effective_rank_every"))
     set_from_config(args, provided_flags, "eval_every", config_get(config, "eval.every_steps"))
     set_from_config(args, provided_flags, "eval_every_epoch", config_get(config, "eval.every_epoch"))
     set_from_config(args, provided_flags, "eval_output_dir", config_get(config, "eval.output_dir"))
@@ -1574,6 +1601,14 @@ def should_log_json(args: argparse.Namespace, step: int) -> bool:
     )
 
 
+def should_compute_effective_rank(args: argparse.Namespace, step: int) -> bool:
+    return args.effective_rank_every > 0 and (
+        step == 1
+        or step == args.max_steps
+        or step % args.effective_rank_every == 0
+    )
+
+
 def model_hidden_size(model: nn.Module) -> int:
     config = getattr(model, "config", None)
     for name in ("hidden_size", "n_embd", "d_model"):
@@ -1859,6 +1894,13 @@ def mean(values: Sequence[int]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
 
 
+def optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
 def batch_indices_for_step(
     *,
     sample_count: int,
@@ -1898,6 +1940,31 @@ def pairwise_cosine_summary(
             )
         ),
     }
+
+
+def effective_rank_diagnostic(
+    states: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    compute: bool,
+) -> tuple[torch.Tensor | None, str, str | None]:
+    if not compute:
+        return None, "skipped", None
+    try:
+        rank = effective_rank(states, mask)
+    except RuntimeError as exc:
+        message = str(exc)
+        if "linalg" not in message.lower() and "eig" not in message.lower():
+            raise
+        return None, "failed", format_diagnostic_error(exc)
+    if not bool(torch.isfinite(rank).detach().cpu().item()):
+        return None, "nonfinite", "effective_rank is not finite"
+    return rank, "ok", None
+
+
+def format_diagnostic_error(exc: BaseException) -> str:
+    message = " ".join(str(exc).split())
+    return f"{type(exc).__name__}: {message}"[:500]
 
 
 def configured_answer_ce_terms(args: argparse.Namespace) -> list[str]:
@@ -2001,6 +2068,7 @@ def build_config_snapshot(
             "keep_best_total_loss": args.keep_best_total_loss,
             "log_every": args.log_every,
             "console_json_every": args.console_json_every,
+            "effective_rank_every": args.effective_rank_every,
             "save_checkpoints": args.save_checkpoints,
             "single_backward_per_batch": True,
             "ema_update_after_optimizer_step": True,
@@ -2052,6 +2120,8 @@ def build_config_snapshot(
         },
         "logging": {
             "log_latent_metrics": True,
+            "effective_rank_online": args.effective_rank_every > 0,
+            "effective_rank_every": args.effective_rank_every,
             "log_alignment_matrices": False,
             "log_target_leakage_checks": True,
             "log_host_losses": True,
@@ -2086,6 +2156,14 @@ def build_summary(
     tail_lsp_mean = sum(float(item["lsp_loss"]) for item in tail) / len(tail)
     lsp_loss_stable_or_decreasing = tail_lsp_mean <= first_lsp * args.loss_stability_ratio
     tail_pairwise_cosine_mean = sum(float(item["pairwise_cosine_mean"]) for item in tail) / len(tail)
+    effective_rank_values = [
+        value
+        for value in (optional_float(item.get("effective_rank")) for item in metrics_history)
+        if value is not None
+    ]
+    effective_rank_statuses = [
+        str(item.get("effective_rank_status", "legacy")) for item in metrics_history
+    ]
     total_loss_finite = all(math.isfinite(float(item["total_loss"])) for item in metrics_history)
     lsp_loss_finite = all(math.isfinite(float(item["lsp_loss"])) for item in metrics_history)
     host_answer_ce_finite = all(
@@ -2195,7 +2273,17 @@ def build_summary(
             "latent_variance_mean_first": float(first["latent_variance_mean"]),
             "latent_variance_mean_last": float(last["latent_variance_mean"]),
             "latent_variance_min_last": float(last["latent_variance_min"]),
-            "effective_rank_last": float(last["effective_rank"]),
+            "effective_rank_last": optional_float(last.get("effective_rank")),
+            "effective_rank_ok_count": len(effective_rank_values),
+            "effective_rank_failed_count": sum(
+                status in {"failed", "nonfinite"} for status in effective_rank_statuses
+            ),
+            "effective_rank_skipped_count": sum(
+                status == "skipped" for status in effective_rank_statuses
+            ),
+            "effective_rank_every": args.effective_rank_every,
+            "effective_rank_status_last": last.get("effective_rank_status", "legacy"),
+            "effective_rank_error_last": last.get("effective_rank_error"),
             "pairwise_cosine_mean_last": float(last["pairwise_cosine_mean"]),
             "pairwise_cosine_tail_mean": tail_pairwise_cosine_mean,
             "pairwise_cosine_fail_threshold": args.pairwise_cosine_fail_threshold,

@@ -191,6 +191,10 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# LSP-JEPA local experiment artifacts
+outputs/
+lsp_jepa/runs/
+
 # PyPI configuration file
 .pypirc
 
