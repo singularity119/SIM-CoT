@@ -132,6 +132,19 @@ def test_core_sequence_config_keeps_forbidden_host_weights_zero():
     assert config["host_losses"]["intermediate_cot_ce_weight"] == 0.0
 
 
+def test_step_trajectory_full_train_config_uses_raw_mse_alignment():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "configs"
+        / "core"
+        / "lsp_step_trajectory_full_train.yaml"
+    )
+    config = yaml.safe_load(config_path.read_text())
+
+    assert config["lsp_objective"]["type"] == "step_trajectory"
+    assert config["loss"]["alignment"] == "mse"
+
+
 def test_loss_composition_preserves_alignment_mask_and_invalid_gradients_are_zero():
     student_states = torch.tensor(
         [

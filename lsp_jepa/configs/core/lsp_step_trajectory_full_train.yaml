@@ -83,14 +83,14 @@ mapping:
   attention_coverage_weight: 0.0
 
 loss:
-  alignment: normalized_mse
-  align_weight: 1.0
+  alignment: mse
+  align_weight: 0.5
   anti_collapse: variance
   anti_collapse_weight: 0.01
   answer_readout_weight: 0.0
 
 host_losses:
-  host_answer_ce_weight: 0.1
+  host_answer_ce_weight: 0.5
   codi_distill_weight: 0.0
   simcot_decoder_weight: 0.0
   intermediate_cot_ce_weight: 0.0

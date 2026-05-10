@@ -28,9 +28,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 try:
     from tqdm.auto import tqdm
@@ -266,6 +269,14 @@ class SampleDataset(Dataset[tuple[int, Sample]]):
         return index, self.samples[index]
 
 
+@dataclass(frozen=True)
+class DistributedContext:
+    enabled: bool
+    rank: int
+    local_rank: int
+    world_size: int
+
+
 def main() -> None:
     args = parse_args()
     if args.objective not in {"sequence", "step_trajectory"}:
@@ -281,8 +292,15 @@ def main() -> None:
     if args.effective_rank_every < 0:
         raise ValueError("--effective-rank-every must be non-negative")
 
-    torch.manual_seed(args.seed)
+    distributed = init_distributed_context(args.device)
+    torch.manual_seed(args.seed + distributed.rank)
     device = resolve_device(args.device)
+    if distributed.enabled:
+        if device.type != "cuda":
+            cleanup_distributed(distributed)
+            raise RuntimeError("distributed training requires --device cuda or --device auto with CUDA")
+        torch.cuda.set_device(distributed.local_rank)
+        device = torch.device("cuda", distributed.local_rank)
     normalize_output_paths(args)
     configure_data_cache(args)
     samples = load_samples(args)
@@ -295,13 +313,18 @@ def main() -> None:
         raise RuntimeError(
             f"need at least batch_size={args.batch_size} samples, found {len(samples)}"
         )
-    args.epoch_steps = steps_per_epoch(len(samples), args.batch_size, args.drop_last)
+    args.distributed = distributed.enabled
+    args.distributed_rank = distributed.rank
+    args.distributed_local_rank = distributed.local_rank
+    args.distributed_world_size = distributed.world_size
+    args.local_batch_size = args.batch_size
+    args.global_batch_size = args.batch_size * distributed.world_size
+    args.epoch_steps = steps_per_epoch(len(samples), args.global_batch_size, args.drop_last)
     if args.save_every_epoch:
         args.save_every = args.epoch_steps
     if args.eval_every_epoch:
         args.eval_every = args.epoch_steps
     train_loader = build_train_dataloader(samples, args)
-    batch_iter = iter_train_batches(train_loader)
 
     tokenizer, base_model = build_tokenizer_and_model(args, samples)
     base_model.to(device)
@@ -321,19 +344,28 @@ def main() -> None:
         end_id,
         tokenizer.eos_token_id,
     ).to(device)
-    student.train()
+    student_core = student
+    student_core.train()
+    if distributed.enabled:
+        student = DistributedDataParallel(
+            student_core,
+            device_ids=[distributed.local_rank],
+            output_device=distributed.local_rank,
+        )
 
     ema_teacher = EMATeacher.from_student(
-        student.base_causallm,
+        student_core.base_causallm,
         decay=args.ema_decay,
         trainable_only=True,
         device=device,
     )
     optimizer = torch.optim.AdamW(
-        student.parameters(),
+        student_core.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    if args.resume_from_checkpoint is not None:
+        args.append_metrics = True
     metrics_path = resolve_metrics_path(args.metrics_path)
     summary_path = resolve_metrics_path(args.summary_path)
     config_snapshot_path = resolve_metrics_path(args.config_snapshot_path)
@@ -344,36 +376,70 @@ def main() -> None:
         if args.eval_metrics_path
         else eval_output_dir / "metrics.jsonl"
     )
-    metrics_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    config_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    if args.eval_every > 0:
-        eval_output_dir.mkdir(parents=True, exist_ok=True)
-        if eval_metrics_path.exists() and not args.append_metrics:
-            eval_metrics_path.unlink()
-    if metrics_path.exists() and not args.append_metrics:
-        metrics_path.unlink()
-    write_config_snapshot(
-        config_snapshot_path,
-        build_config_snapshot(
-            args,
+    if is_main_process(distributed):
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        config_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        if args.eval_every > 0:
+            eval_output_dir.mkdir(parents=True, exist_ok=True)
+            if eval_metrics_path.exists() and not args.append_metrics:
+                eval_metrics_path.unlink()
+        if metrics_path.exists() and not args.append_metrics:
+            metrics_path.unlink()
+        write_config_snapshot(
+            config_snapshot_path,
+            build_config_snapshot(
+                args,
+                device=device,
+                sample_count=len(samples),
+                metrics_path=metrics_path,
+                summary_path=summary_path,
+                config_snapshot_path=config_snapshot_path,
+            ),
+        )
+    distributed_barrier(distributed)
+
+    start_step = 0
+    if args.resume_from_checkpoint is not None:
+        start_step = load_training_checkpoint(
+            args.resume_from_checkpoint,
+            student=student_core,
+            ema_teacher=ema_teacher,
+            optimizer=optimizer,
             device=device,
-            sample_count=len(samples),
-            metrics_path=metrics_path,
-            summary_path=summary_path,
-            config_snapshot_path=config_snapshot_path,
-        ),
+        )
+        if start_step >= args.max_steps:
+            if is_main_process(distributed):
+                print(
+                    json.dumps(
+                        {
+                            "resume_from_checkpoint": str(args.resume_from_checkpoint),
+                            "checkpoint_step": start_step,
+                            "max_steps": args.max_steps,
+                            "status": "already_complete",
+                        },
+                        sort_keys=True,
+                    )
+                )
+            distributed_barrier(distributed)
+            cleanup_distributed(distributed)
+            return
+    batch_iter = iter_train_batches(
+        train_loader,
+        start_epoch=start_step // args.epoch_steps,
     )
+    for _ in range(start_step % args.epoch_steps):
+        next(batch_iter)
 
     adapter = CoconutLSPAdapter(latent_token_id=latent_id)
     metrics_history: list[dict[str, Any]] = []
     seen_sample_indices: set[int] = set()
     best_total_loss: float | None = None
     best_checkpoint_path: Path | None = None
-    progress = build_tqdm_progress(args)
+    progress = build_tqdm_progress(args, initial=start_step) if is_main_process(distributed) else None
 
-    for train_step in range(1, args.max_steps + 1):
+    for train_step in range(start_step + 1, args.max_steps + 1):
         batch_indices, batch_samples = next(batch_iter)
         seen_sample_indices.update(batch_indices)
         teacher_inputs = build_teacher_batch(tokenizer, batch_samples, args, device)
@@ -491,7 +557,7 @@ def main() -> None:
 
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
-        student_base_grad_l1 = grad_l1(student)
+        student_base_grad_l1 = grad_l1(student_core)
         student_grad_l1 = student_base_grad_l1
         if student_grad_l1 <= 0.0 or not math.isfinite(student_grad_l1):
             raise RuntimeError("student parameters did not receive finite gradients")
@@ -502,18 +568,20 @@ def main() -> None:
 
         teacher_before = clone_params(ema_teacher.teacher_model)
         optimizer.step()
-        ema_teacher.update(student.base_causallm)
+        ema_teacher.update(student_core.base_causallm)
         teacher_delta_l1 = param_delta_l1(teacher_before, ema_teacher.teacher_model)
         if teacher_delta_l1 <= 0.0 or not math.isfinite(teacher_delta_l1):
             raise RuntimeError("EMA update did not change teacher parameters")
-        checkpoint_path = maybe_save_checkpoint(
-            args,
-            step=train_step,
-            checkpoint_dir=checkpoint_dir,
-            student=student,
-            ema_teacher=ema_teacher,
-            optimizer=optimizer,
-        )
+        checkpoint_path = None
+        if is_main_process(distributed):
+            checkpoint_path = maybe_save_checkpoint(
+                args,
+                step=train_step,
+                checkpoint_dir=checkpoint_dir,
+                student=student_core,
+                ema_teacher=ema_teacher,
+                optimizer=optimizer,
+            )
         if checkpoint_path is not None:
             total_loss_value = to_float(total_loss)
             if args.keep_best_total_loss and (
@@ -534,17 +602,23 @@ def main() -> None:
                 keep_last=args.keep_last_checkpoints,
                 keep_paths=[best_checkpoint_path] if best_checkpoint_path is not None else [],
             )
-        epoch_eval = maybe_run_epoch_eval(
-            args,
-            step=train_step,
-            student=student,
-            tokenizer=tokenizer,
-            eval_samples=epoch_eval_samples,
-            checkpoint_path=checkpoint_path,
-            eval_output_dir=eval_output_dir,
-            eval_metrics_path=eval_metrics_path,
-            device=device,
-        )
+        epoch_eval = None
+        if is_main_process(distributed):
+            epoch_eval = maybe_run_epoch_eval(
+                args,
+                step=train_step,
+                student=student_core,
+                tokenizer=tokenizer,
+                eval_samples=epoch_eval_samples,
+                checkpoint_path=checkpoint_path,
+                eval_output_dir=eval_output_dir,
+                eval_metrics_path=eval_metrics_path,
+                device=device,
+            )
+        distributed_barrier(distributed)
+
+        if not is_main_process(distributed):
+            continue
 
         metrics = {
             "step": train_step,
@@ -579,7 +653,11 @@ def main() -> None:
             "epoch_steps": args.epoch_steps,
             "epoch_index": epoch_index(train_step, args.epoch_steps),
             "unique_samples_seen": len(seen_sample_indices),
-            "batch_size": args.batch_size,
+            "batch_size": args.global_batch_size,
+            "local_batch_size": args.local_batch_size,
+            "distributed": distributed.enabled,
+            "distributed_world_size": distributed.world_size,
+            "distributed_rank": distributed.rank,
             "batch_indices": batch_indices,
             "data_source": args.dataset_source if args.data_path is None else str(args.data_path),
             "batch_sample_sources": [sample.source for sample in batch_samples],
@@ -662,30 +740,33 @@ def main() -> None:
             if should_log_json(args, train_step):
                 progress_write(progress, json.dumps(metrics, sort_keys=True))
 
-    close_tqdm_progress(progress)
-    summary = build_summary(
-        metrics_history,
-        args=args,
-        sample_count=len(samples),
-        unique_samples_seen=len(seen_sample_indices),
-        metrics_path=metrics_path,
-        summary_path=summary_path,
-        config_snapshot_path=config_snapshot_path,
-    )
-    write_json(summary_path, summary)
-    print(
-        json.dumps(
-            {
-                "metrics_path": str(metrics_path),
-                "summary_path": str(summary_path),
-                "config_snapshot_path": str(config_snapshot_path),
-                "completed_steps": args.max_steps,
-                "unique_samples_seen": len(seen_sample_indices),
-                "acceptance_passed": summary["acceptance"]["passed"],
-            },
-            sort_keys=True,
+    if is_main_process(distributed):
+        close_tqdm_progress(progress)
+        summary = build_summary(
+            metrics_history,
+            args=args,
+            sample_count=len(samples),
+            unique_samples_seen=len(seen_sample_indices),
+            metrics_path=metrics_path,
+            summary_path=summary_path,
+            config_snapshot_path=config_snapshot_path,
         )
-    )
+        write_json(summary_path, summary)
+        print(
+            json.dumps(
+                {
+                    "metrics_path": str(metrics_path),
+                    "summary_path": str(summary_path),
+                    "config_snapshot_path": str(config_snapshot_path),
+                    "completed_steps": args.max_steps,
+                    "unique_samples_seen": len(seen_sample_indices),
+                    "acceptance_passed": summary["acceptance"]["passed"],
+                },
+                sort_keys=True,
+            )
+        )
+    distributed_barrier(distributed)
+    cleanup_distributed(distributed)
 
 
 def parse_args() -> argparse.Namespace:
@@ -721,6 +802,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--append-metrics", action="store_true")
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=Path,
+        default=None,
+        help="Load student, EMA teacher, and optimizer state from a step_*.pt checkpoint.",
+    )
     parser.add_argument("--autodl-root", default="/root/autodl-tmp")
     parser.add_argument("--data-cache-dir", default=None)
     parser.add_argument("--dataset-local-path", type=Path, default=None)
@@ -986,6 +1073,35 @@ def resolve_device(requested: str) -> torch.device:
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     return torch.device(requested)
+
+
+def init_distributed_context(requested_device: str) -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size <= 1:
+        return DistributedContext(False, rank=0, local_rank=0, world_size=1)
+    if requested_device == "cpu":
+        raise RuntimeError("distributed training requires CUDA")
+    if not torch.cuda.is_available():
+        raise RuntimeError("distributed training requires CUDA")
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return DistributedContext(True, rank=rank, local_rank=local_rank, world_size=world_size)
+
+
+def is_main_process(distributed: DistributedContext) -> bool:
+    return not distributed.enabled or distributed.rank == 0
+
+
+def distributed_barrier(distributed: DistributedContext) -> None:
+    if distributed.enabled:
+        dist.barrier()
+
+
+def cleanup_distributed(distributed: DistributedContext) -> None:
+    if distributed.enabled and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def default_samples(limit: int = 2) -> list[Sample]:
@@ -1407,13 +1523,25 @@ def build_train_dataloader(
 ) -> DataLoader[tuple[list[int], list[Sample]]]:
     generator = torch.Generator()
     generator.manual_seed(args.seed)
+    dataset = SampleDataset(samples)
+    sampler = None
+    if getattr(args, "distributed", False):
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=int(args.distributed_world_size),
+            rank=int(args.distributed_rank),
+            shuffle=args.shuffle,
+            drop_last=args.drop_last and len(samples) >= args.global_batch_size,
+            seed=args.seed,
+        )
     return DataLoader(
-        SampleDataset(samples),
+        dataset,
         batch_size=args.batch_size,
-        shuffle=args.shuffle,
-        drop_last=args.drop_last and len(samples) >= args.batch_size,
+        shuffle=args.shuffle and sampler is None,
+        sampler=sampler,
+        drop_last=args.drop_last and len(samples) >= args.global_batch_size,
         collate_fn=collate_sample_items,
-        generator=generator,
+        generator=generator if sampler is None else None,
     )
 
 
@@ -1425,10 +1553,17 @@ def collate_sample_items(items: Sequence[tuple[int, Sample]]) -> tuple[list[int]
 
 def iter_train_batches(
     dataloader: DataLoader[tuple[list[int], list[Sample]]],
+    *,
+    start_epoch: int = 0,
 ) -> Any:
+    epoch = start_epoch
     while True:
+        sampler = getattr(dataloader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
         for batch in dataloader:
             yield batch
+        epoch += 1
 
 
 def steps_per_epoch(sample_count: int, batch_size: int, drop_last: bool) -> int:
@@ -1506,11 +1641,12 @@ def compute_step_trajectory_state_loss(
     return per_sample[valid_samples].mean()
 
 
-def build_tqdm_progress(args: argparse.Namespace) -> Any:
+def build_tqdm_progress(args: argparse.Namespace, *, initial: int = 0) -> Any:
     if not args.tqdm_progress or tqdm is None:
         return None
     progress = tqdm(
         total=args.max_steps,
+        initial=initial,
         desc=args.objective,
         dynamic_ncols=sys.stdout.isatty(),
         mininterval=1.0,
@@ -1617,6 +1753,44 @@ def model_hidden_size(model: nn.Module) -> int:
             return int(value)
     embeddings = model.get_input_embeddings()
     return int(embeddings.embedding_dim)
+
+
+def load_training_checkpoint(
+    path: Path,
+    *,
+    student: nn.Module,
+    ema_teacher: EMATeacher,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> int:
+    checkpoint_path = resolve_repo_path(path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"resume checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError(f"checkpoint must contain a mapping payload: {checkpoint_path}")
+    step = int(checkpoint.get("step") or 0)
+    if step < 1:
+        raise ValueError(f"checkpoint has invalid step={step}: {checkpoint_path}")
+    student_state = checkpoint.get("student_base_causallm")
+    ema_state = checkpoint.get("ema_teacher")
+    optimizer_state = checkpoint.get("optimizer")
+    if not isinstance(student_state, Mapping):
+        raise ValueError(f"checkpoint missing student_base_causallm state: {checkpoint_path}")
+    if not isinstance(ema_state, Mapping):
+        raise ValueError(f"checkpoint missing ema_teacher state: {checkpoint_path}")
+    if not isinstance(optimizer_state, Mapping):
+        raise ValueError(f"checkpoint missing optimizer state: {checkpoint_path}")
+    student.base_causallm.load_state_dict(student_state)
+    ema_teacher.teacher_model.load_state_dict(ema_state)
+    optimizer.load_state_dict(optimizer_state)
+    for state in optimizer.state.values():
+        if not isinstance(state, dict):
+            continue
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device)
+    return step
 
 
 def maybe_save_checkpoint(
@@ -2061,6 +2235,10 @@ def build_config_snapshot(
             "max_steps": args.max_steps,
             "supported_max_steps": [100, 500],
             "batch_size": args.batch_size,
+            "local_batch_size": args.local_batch_size,
+            "global_batch_size": args.global_batch_size,
+            "distributed": args.distributed,
+            "distributed_world_size": args.distributed_world_size,
             "epoch_steps": args.epoch_steps,
             "save_every": args.save_every,
             "save_every_epoch": args.save_every_epoch,
