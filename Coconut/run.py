@@ -33,8 +33,10 @@ import os, sys
 import yaml
 import json
 import gc
+from datetime import datetime
 import argparse
 import functools
+from contextlib import nullcontext
 from utils import Config, set_seed
 def check_requires_grad(model):
     for name, param in model.named_parameters():
@@ -83,25 +85,34 @@ def main():
     # check if the job is preempted and resumed.
 
     if len(cur_ckpts) > 0 and not configs.only_eval:
-        # if there are previous checkpoints, and only_eval is False
-        # it means the previous run was preempted and the program is restarted.
-        # need to find the latest checkpoint and resume from that.
-
-        if rank == 0:
-            print(
-                f"Warning: found previous run and gonna resume from that. the inputted `resume` argument is ignored!"
-            )
-
+        # Prefer the fixed-retention checkpoint from this script.
+        # Fall back to legacy checkpoint_N files if resuming older runs.
+        latest_path = os.path.join(save_dir, "latest.pt")
+        latest_meta_path = os.path.join(save_dir, "latest.json")
         checkpoints = [f for f in cur_ckpts if f.startswith("checkpoint_")]
         checkpoints.sort(key=lambda x: int(x.split("_")[1]))
 
-        # Get the last item in the sorted list
-        latest_checkpoint = checkpoints[-1] if checkpoints else None
-        configs.resume = int(latest_checkpoint.split("_")[1])
-        load_dir = os.path.join(configs.save_path, configs.name, latest_checkpoint)
-
-        configs.load_model_path = load_dir
-        print(f"Loading from previous run epoch_{configs.resume}!")
+        if os.path.exists(latest_path) and os.path.exists(latest_meta_path):
+            with open(latest_meta_path, "r", encoding="utf-8") as f:
+                latest_meta = json.load(f)
+            configs.resume = int(latest_meta["epoch"])
+            configs.load_model_path = latest_path
+            if rank == 0:
+                print(f"Loading from latest.pt after epoch {configs.resume}!")
+        elif checkpoints:
+            if rank == 0:
+                print(
+                    f"Warning: found previous run and gonna resume from that. the inputted `resume` argument is ignored!"
+                )
+            latest_checkpoint = checkpoints[-1]
+            configs.resume = int(latest_checkpoint.split("_")[1])
+            load_dir = os.path.join(configs.save_path, configs.name, latest_checkpoint)
+            configs.load_model_path = load_dir
+            print(f"Loading from previous run epoch_{configs.resume}!")
+        elif rank == 0:
+            print(
+                f"Warning: {save_dir} is non-empty but no resumable checkpoint was found; starting from config."
+            )
 
     elif configs.resume != 0:
         # by setting `resume`, we can skip a few epoches at the beginning.
@@ -261,7 +272,35 @@ def main():
             weight_decay=configs.weight_decay,
         )
 
-    best_acc = 0
+    best_acc = 0.0
+    best_loss = float("inf")
+    best_acc_meta_path = os.path.join(save_dir, "best_eval_accuracy.json")
+    best_loss_meta_path = os.path.join(save_dir, "best_eval_loss.json")
+    if os.path.exists(best_acc_meta_path):
+        with open(best_acc_meta_path, "r", encoding="utf-8") as f:
+            best_acc = float(json.load(f).get("eval_accuracy", 0.0))
+    if os.path.exists(best_loss_meta_path):
+        with open(best_loss_meta_path, "r", encoding="utf-8") as f:
+            best_loss = float(json.load(f).get("eval_loss", float("inf")))
+
+    curriculum_end_epoch = None
+    if (
+        not configs.cot
+        and not configs.no_cot
+        and not configs.no_thoughts
+        and getattr(configs, "max_latent_stage", 0) > 0
+        and getattr(configs, "epochs_per_stage", 0) > 0
+    ):
+        # scheduled_stage = epoch // epochs_per_stage. The last epoch with
+        # scheduled_stage == max_latent_stage is the curriculum boundary.
+        curriculum_end_epoch = (
+            int(configs.max_latent_stage) + 1
+        ) * int(configs.epochs_per_stage)
+        if rank == 0:
+            print(
+                "latent curriculum end checkpoint target: "
+                f"completed_epoch={curriculum_end_epoch}"
+            )
 
     # collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
     collator = MyCollator(tokenizer, latent_id=latent_id, label_pad_token_id=-100)
@@ -417,22 +456,7 @@ def main():
             pbar.close()
             dist.barrier()
 
-            if (
-                not configs.save_only_improve
-                and not configs.debug
-                and not configs.only_eval
-            ):
-                states = parallel_model.state_dict()
-                if rank == 0:
-                    torch.save(
-                        states, os.path.join(save_dir, f"checkpoint_{epoch + 1}")
-                    )
-                    print("saving model.")
-
-                dist.barrier()
-                del states
-                gc.collect()
-                torch.cuda.empty_cache()
+            # Checkpointing is handled after generation eval so retention stays fixed-size.
 
             # val loss
             total_loss = 0
@@ -450,15 +474,16 @@ def main():
                     dist.all_reduce(loss, op=dist.ReduceOp.SUM)
                     total_loss += loss.item() / world_size
 
+                epoch_eval_loss = total_loss / len(valid_loss_dataloader)
                 if rank == 0:
 
                     log_dict = {
-                        "eval/loss": total_loss / len(valid_loss_dataloader),
+                        "eval/loss": epoch_eval_loss,
                     }
-                   
+
                     if wandb_run:
                         wandb_run.log(log_dict)
-                    print("eval loss", total_loss / len(valid_loss_dataloader))
+                    print("eval loss", epoch_eval_loss)
 
         # val generation accuracy
         total_length = len(valid_gen_dataloader)
@@ -471,14 +496,21 @@ def main():
             torch.tensor(0, device=local_rank),
             torch.tensor(0, device=local_rank),
         )
-        if hasattr(configs, "train_or_eval") and configs.train_or_eval == 'eval':
-            with torch.no_grad():
-                parallel_model.module.eval()
+        with torch.no_grad():
+            parallel_model.module.eval()
+            gen_param_context = (
+                nullcontext()
+                if configs.only_eval
+                else FSDP.summon_full_params(
+                    parallel_model, writeback=False, recurse=True
+                )
+            )
+            with gen_param_context:
                 for idx, batch in enumerate(valid_gen_dataloader):
                     test_idx = batch["idx"][0]
 
                     batch = {
-                        k: v.to(rank)
+                        k: v.to(local_rank)
                         for k, v in batch.items()
                         if v != None and k not in ["idx", "position_ids"]
                     }
@@ -491,13 +523,13 @@ def main():
 
                     total += 1
 
-                    # synced_gpus=True in FSDP mode, as we need to keep # forward pass the same on each device
+                    # Direct module.generate bypasses FSDP's parameter all-gather.
                     outputs = parallel_model.module.generate(
                         **batch,
                         max_new_tokens=max_new_tokens,
                         synced_gpus=not configs.only_eval,
                     )
-                    
+
                     text_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
                     answer_output = text_output.split("#")[-1].replace(",", "").strip()
                     cot_output = (
@@ -519,41 +551,105 @@ def main():
                         f"Test accuracy: {round(float(cor.detach().float() / total.detach().float()), 2)}"
                     )
 
-                pbar.close()
-                print(f"Device {rank}: Cor={cor}, CoT={cor_cot}, Total={total}")
+            pbar.close()
+            print(f"Device {rank}: Cor={cor}, CoT={cor_cot}, Total={total}")
 
-            dist.all_reduce(cor_cot, op=dist.ReduceOp.SUM)
-            dist.all_reduce(cor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(total, op=dist.ReduceOp.SUM)
+        dist.all_reduce(cor_cot, op=dist.ReduceOp.SUM)
+        dist.all_reduce(cor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total, op=dist.ReduceOp.SUM)
 
-            cor_cot = cor_cot.item()
-            cor = cor.item()
-            total = total.item()
-            if rank == 0:
-                print(f"Accuracy on validation set: {cor} / {total} = {cor/total}")
-                print(f"CoT match on validation set: {cor_cot} / {total} = {cor_cot/total}")
-            sys.stdout.flush()
+        cor_cot = cor_cot.item()
+        cor = cor.item()
+        total = total.item()
+        eval_acc = cor / total
+        eval_cot_em = cor_cot / total
+        if rank == 0:
+            print(f"Accuracy on validation set: {cor} / {total} = {eval_acc}")
+            print(f"CoT match on validation set: {cor_cot} / {total} = {eval_cot_em}")
+        sys.stdout.flush()
 
-            if wandb_run:
-                wandb_run.log({"eval/acc": cor / total, "eval/cot_em": cor_cot / total})
+        if wandb_run:
+            wandb_run.log({"eval/acc": eval_acc, "eval/cot_em": eval_cot_em})
 
-            if configs.only_eval:
-                break
+        if configs.only_eval:
+            break
 
-            dist.barrier()
-        else:
-            states = parallel_model.state_dict()
+        states = parallel_model.state_dict()
 
-            if rank == 0:
-                torch.save(states, os.path.join(save_dir, f"checkpoint_{epoch + 1}"))
-                print("saving model.")
+        if rank == 0:
+            def save_retained_checkpoint(stem, reason):
+                checkpoint_path = os.path.join(save_dir, f"{stem}.pt")
+                source_info = {
+                    "epoch_index": epoch + 1,
+                    "epoch_steps": len(train_dataloader),
+                    "step": (epoch + 1) * len(train_dataloader),
+                    "scheduled_stage": scheduled_stage,
+                    "eval_loss": epoch_eval_loss,
+                    "accuracy": eval_acc,
+                    "exact_match": eval_acc,
+                    "cot_em": eval_cot_em,
+                    "num_eval_samples": total,
+                    "eval_correct": cor,
+                    "eval_cot_correct": cor_cot,
+                }
+                metadata = {
+                    "checkpoint": f"{stem}.pt",
+                    "checkpoint_path": checkpoint_path,
+                    "checkpoint_type": reason,
+                    "epoch": epoch + 1,
+                    "completed_epoch": epoch + 1,
+                    "epoch_index": epoch + 1,
+                    "epoch_steps": len(train_dataloader),
+                    "step": (epoch + 1) * len(train_dataloader),
+                    "num_epochs": configs.num_epochs,
+                    "scheduled_stage": scheduled_stage,
+                    "max_latent_stage": getattr(configs, "max_latent_stage", None),
+                    "epochs_per_stage": getattr(configs, "epochs_per_stage", None),
+                    "curriculum_end_epoch": curriculum_end_epoch,
+                    "eval_loss": epoch_eval_loss,
+                    "eval_accuracy": eval_acc,
+                    "eval_correct": cor,
+                    "eval_total": total,
+                    "eval_cot_em": eval_cot_em,
+                    "eval_cot_correct": cor_cot,
+                    "current": source_info,
+                    "preserved_checkpoint_path": checkpoint_path,
+                    "source_checkpoint_path": checkpoint_path,
+                    "source_epoch_index": epoch + 1,
+                    "source": "Coconut/run.py",
+                    "status": "kept",
+                    "updated_at": datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+                torch.save(states, checkpoint_path)
+                with open(os.path.join(save_dir, f"{stem}.json"), "w", encoding="utf-8") as f:
+                    json.dump(metadata, f, ensure_ascii=False, indent=2)
 
-            best_acc = cor / total
+            save_retained_checkpoint("latest", "latest")
+            print("saving latest checkpoint.")
 
-            dist.barrier()
-            del states
-            gc.collect()
-            torch.cuda.empty_cache()
+            if curriculum_end_epoch is not None and epoch + 1 == curriculum_end_epoch:
+                save_retained_checkpoint(
+                    "latent_curriculum_end", "latent_curriculum_end"
+                )
+                print(
+                    "saving latent curriculum end checkpoint "
+                    f"at completed epoch {epoch + 1}."
+                )
+
+            if eval_acc > best_acc:
+                best_acc = eval_acc
+                save_retained_checkpoint("best_eval_accuracy", "best_eval_accuracy")
+                print("saving best eval accuracy checkpoint.")
+
+            if epoch_eval_loss < best_loss:
+                best_loss = epoch_eval_loss
+                save_retained_checkpoint("best_eval_loss", "best_eval_loss")
+                print("saving best eval loss checkpoint.")
+
+        dist.barrier()
+        del states
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

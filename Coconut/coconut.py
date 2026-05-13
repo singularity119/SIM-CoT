@@ -7,8 +7,32 @@ from torch.nn import CrossEntropyLoss
 from collections import namedtuple
 from transformers.models.gpt2 import GPT2LMHeadModel
 import copy
+try:
+    from transformers import DynamicCache
+except ImportError:
+    DynamicCache = None
+
 Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
 MAX_N_LATENT = 8
+
+
+def _slice_past_key_values(kv_cache, end_idx):
+    """Keep cache entries compatible across legacy tuple and Cache APIs."""
+    if kv_cache is None:
+        return None
+
+    sliced = []
+    for layer_cache in kv_cache:
+        key_states, value_states = layer_cache[:2]
+        sliced.append(
+            (
+                key_states[:, :, :end_idx, :],
+                value_states[:, :, :end_idx, :],
+            )
+        )
+    if hasattr(kv_cache, "get_seq_length") and DynamicCache is not None:
+        return DynamicCache(sliced)
+    return sliced
 
 
 class Coconut(nn.Module):
@@ -80,13 +104,9 @@ class Coconut(nn.Module):
 
             else:
                 # extract kv cache to reuse
-                past_key_values = [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
+                past_key_values = _slice_past_key_values(
+                    kv_cache, next_compute_range[0]
+                )
 
                 outputs = self.base_causallm(
                     inputs_embeds=inputs_embeds[
@@ -164,17 +184,7 @@ class Coconut(nn.Module):
             ],
             attention_mask=attention_mask[:, : next_compute_range[1]],
             position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
-            past_key_values=(
-                [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
-                if kv_cache
-                else None
-            ),
+            past_key_values=_slice_past_key_values(kv_cache, next_compute_range[0]),
             output_hidden_states=True,
         )
 
@@ -358,13 +368,9 @@ class CoconutGPT_Same_Word_Embedding(nn.Module):
 
             else:
                 # extract kv cache to reuse
-                past_key_values = [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
+                past_key_values = _slice_past_key_values(
+                    kv_cache, next_compute_range[0]
+                )
 
                 outputs = self.base_causallm(
                     inputs_embeds=inputs_embeds[
@@ -442,17 +448,7 @@ class CoconutGPT_Same_Word_Embedding(nn.Module):
             ],
             attention_mask=attention_mask[:, : next_compute_range[1]],
             position_ids=position_ids[:, next_compute_range[0] : next_compute_range[1]],
-            past_key_values=(
-                [
-                    (
-                        k[:, :, : next_compute_range[0], :],
-                        v[:, :, : next_compute_range[0], :],
-                    )
-                    for k, v in kv_cache
-                ]
-                if kv_cache
-                else None
-            ),
+            past_key_values=_slice_past_key_values(kv_cache, next_compute_range[0]),
             output_hidden_states=True,
         )
 

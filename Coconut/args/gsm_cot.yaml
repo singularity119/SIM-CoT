@@ -2,8 +2,8 @@
 # torchrun --nnodes 1 --nproc_per_node 8 run.py args/gsm_cot.yaml
 
 project: coconut
-save_path: ./ckpts/
-name: gsm-cot
+save_path: /root/autodl-tmp/simcot_coconut/ckpts
+name: gsm_cot
 
 only_eval: False
 
@@ -22,17 +22,17 @@ save_only_improve: True
 uniform_prob: 0.0
 
 # Model and checkpoint paths - use relative paths or environment variables
-model_id: ./pretrained/gpt2
-load_model_path: null   # or ${CKPT_PATH}/checkpoint_xx
+model_id: /root/autodl-tmp/hf_cache/hub/models--openai-community--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e
+load_model_path: None   # no checkpoint for explicit CoT SFT
 seed: 0
 resume: 0
 bf16: False
 
-train_path: ./data/gsm_train.json
-val_path: ./data/gsm_test.json
+train_path: /root/autodl-tmp/simcot_coconut/data/gsm8k_aug_train.json
+val_path: /root/autodl-tmp/simcot_coconut/data/gsm8k_aug_test.json
 
 reset_optimizer: False
-batch_size_training: 16
+batch_size_training: 32
 debug: False
 gradient_accumulation_steps: 1
 num_epochs: 25
