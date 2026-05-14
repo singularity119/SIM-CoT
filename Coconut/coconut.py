@@ -12,7 +12,10 @@ try:
 except ImportError:
     DynamicCache = None
 
-Outputs = namedtuple("Outputs", ["loss", "inputs_embeds", "logits"])
+Outputs = namedtuple(
+    "Outputs",
+    ["loss", "inputs_embeds", "logits", "latent_states", "latent_mask"],
+)
 MAX_N_LATENT = 8
 
 
@@ -33,6 +36,58 @@ def _slice_past_key_values(kv_cache, end_idx):
     if hasattr(kv_cache, "get_seq_length") and DynamicCache is not None:
         return DynamicCache(sliced)
     return sliced
+
+
+def _init_latent_state_slots(latent_lists):
+    return [[None for _ in latent_positions] for latent_positions in latent_lists]
+
+
+def _record_latent_hidden_states(
+    latent_state_slots,
+    latent_lists,
+    hidden_states,
+    compute_range,
+    hidden_states_offset,
+):
+    range_start, range_end = compute_range
+    for batch_idx, latent_positions in enumerate(latent_lists):
+        for latent_idx, token_idx in enumerate(latent_positions):
+            if range_start <= token_idx < range_end:
+                latent_state_slots[batch_idx][latent_idx] = hidden_states[
+                    batch_idx,
+                    token_idx - hidden_states_offset,
+                    :,
+                ]
+
+
+def _pack_latent_state_slots(latent_state_slots, inputs_embeds):
+    batch_size = len(latent_state_slots)
+    max_n_latents = max((len(slots) for slots in latent_state_slots), default=0)
+    hidden_size = inputs_embeds.shape[-1]
+    latent_mask = torch.zeros(
+        batch_size,
+        max_n_latents,
+        dtype=torch.bool,
+        device=inputs_embeds.device,
+    )
+
+    if max_n_latents == 0:
+        return inputs_embeds.new_empty(batch_size, 0, hidden_size), latent_mask
+
+    zero_state = inputs_embeds.new_zeros(hidden_size)
+    rows = []
+    for batch_idx, slots in enumerate(latent_state_slots):
+        values = []
+        for latent_idx in range(max_n_latents):
+            state = slots[latent_idx] if latent_idx < len(slots) else None
+            if state is None:
+                values.append(zero_state)
+            else:
+                values.append(state)
+                latent_mask[batch_idx, latent_idx] = True
+        rows.append(torch.stack(values, dim=0))
+
+    return torch.stack(rows, dim=0), latent_mask
 
 
 class Coconut(nn.Module):
@@ -83,8 +138,10 @@ class Coconut(nn.Module):
             # before the earliest latent token position
 
         kv_cache = None
+        latent_state_slots = _init_latent_state_slots(latent_lists)
 
         for pass_idx in range(max_n_latents):
+            current_compute_range = next_compute_range
 
             if kv_cache == None:
                 # first forward pass
@@ -139,6 +196,13 @@ class Coconut(nn.Module):
             hidden_states = outputs.hidden_states[
                 -1
             ]  # Get the last layer hidden states
+            _record_latent_hidden_states(
+                latent_state_slots,
+                latent_lists,
+                hidden_states,
+                current_compute_range,
+                hidden_states_offset,
+            )
             kv_cache = outputs.past_key_values
 
             # feedback the continuous thoughts to the input_embeds
@@ -178,6 +242,7 @@ class Coconut(nn.Module):
             )
 
         # final pass
+        current_compute_range = next_compute_range
         outputs = self.base_causallm(
             inputs_embeds=inputs_embeds[
                 :, next_compute_range[0] : next_compute_range[1], :
@@ -189,6 +254,14 @@ class Coconut(nn.Module):
         )
 
         logits.append(outputs.logits)
+        hidden_states = outputs.hidden_states[-1]
+        _record_latent_hidden_states(
+            latent_state_slots,
+            latent_lists,
+            hidden_states,
+            current_compute_range,
+            current_compute_range[0],
+        )
 
         self.gen_forward_cnt += max_n_latents + 1
 
@@ -200,7 +273,18 @@ class Coconut(nn.Module):
             shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
         )
 
-        return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
+        latent_states, latent_mask = _pack_latent_state_slots(
+            latent_state_slots,
+            inputs_embeds,
+        )
+
+        return Outputs(
+            loss=loss,
+            inputs_embeds=inputs_embeds,
+            logits=logits,
+            latent_states=latent_states,
+            latent_mask=latent_mask,
+        )
 
     def train(self):
         self.base_causallm.train()
@@ -347,8 +431,10 @@ class CoconutGPT_Same_Word_Embedding(nn.Module):
             # before the earliest latent token position
 
         kv_cache = None
+        latent_state_slots = _init_latent_state_slots(latent_lists)
 
         for pass_idx in range(max_n_latents):
+            current_compute_range = next_compute_range
 
             if kv_cache == None:
                 # first forward pass
@@ -403,6 +489,13 @@ class CoconutGPT_Same_Word_Embedding(nn.Module):
             hidden_states = outputs.hidden_states[
                 -1
             ]  # Get the last layer hidden states
+            _record_latent_hidden_states(
+                latent_state_slots,
+                latent_lists,
+                hidden_states,
+                current_compute_range,
+                hidden_states_offset,
+            )
             kv_cache = outputs.past_key_values
 
             # feedback the continuous thoughts to the input_embeds
@@ -442,6 +535,7 @@ class CoconutGPT_Same_Word_Embedding(nn.Module):
             )
 
         # final pass
+        current_compute_range = next_compute_range
         outputs = self.base_causallm(
             inputs_embeds=inputs_embeds[
                 :, next_compute_range[0] : next_compute_range[1], :
@@ -453,6 +547,14 @@ class CoconutGPT_Same_Word_Embedding(nn.Module):
         )
 
         logits.append(outputs.logits)
+        hidden_states = outputs.hidden_states[-1]
+        _record_latent_hidden_states(
+            latent_state_slots,
+            latent_lists,
+            hidden_states,
+            current_compute_range,
+            current_compute_range[0],
+        )
 
         self.gen_forward_cnt += max_n_latents + 1
 
@@ -780,7 +882,18 @@ class CoconutGPT_Same_Word_Embedding(nn.Module):
                 loss = 0.0
             loss += 1.0 * loss_explain_all / c_thought_num
 
-        return Outputs(loss=loss, inputs_embeds=inputs_embeds, logits=logits)
+        latent_states, latent_mask = _pack_latent_state_slots(
+            latent_state_slots,
+            inputs_embeds,
+        )
+
+        return Outputs(
+            loss=loss,
+            inputs_embeds=inputs_embeds,
+            logits=logits,
+            latent_states=latent_states,
+            latent_mask=latent_mask,
+        )
 
     def train(self):
         self.base_causallm.train()
