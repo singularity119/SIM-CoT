@@ -274,14 +274,21 @@ def main():
 
     best_acc = 0.0
     best_loss = float("inf")
+    best_full_latent_acc = 0.0
     best_acc_meta_path = os.path.join(save_dir, "best_eval_accuracy.json")
     best_loss_meta_path = os.path.join(save_dir, "best_eval_loss.json")
+    best_full_latent_acc_meta_path = os.path.join(
+        save_dir, "best_full_latent_eval_accuracy.json"
+    )
     if os.path.exists(best_acc_meta_path):
         with open(best_acc_meta_path, "r", encoding="utf-8") as f:
             best_acc = float(json.load(f).get("eval_accuracy", 0.0))
     if os.path.exists(best_loss_meta_path):
         with open(best_loss_meta_path, "r", encoding="utf-8") as f:
             best_loss = float(json.load(f).get("eval_loss", float("inf")))
+    if os.path.exists(best_full_latent_acc_meta_path):
+        with open(best_full_latent_acc_meta_path, "r", encoding="utf-8") as f:
+            best_full_latent_acc = float(json.load(f).get("eval_accuracy", 0.0))
 
     curriculum_end_epoch = None
     if (
@@ -633,6 +640,21 @@ def main():
                 )
                 print(
                     "saving latent curriculum end checkpoint "
+                    f"at completed epoch {epoch + 1}."
+                )
+
+            if (
+                curriculum_end_epoch is not None
+                and epoch + 1 > curriculum_end_epoch
+                and eval_acc > best_full_latent_acc
+            ):
+                best_full_latent_acc = eval_acc
+                save_retained_checkpoint(
+                    "best_full_latent_eval_accuracy",
+                    "best_full_latent_eval_accuracy",
+                )
+                print(
+                    "saving best full latent eval accuracy checkpoint "
                     f"at completed epoch {epoch + 1}."
                 )
 
