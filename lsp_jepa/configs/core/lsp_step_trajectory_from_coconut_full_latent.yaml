@@ -1,0 +1,128 @@
+experiment:
+  mode: core
+  host: simcot
+  backbone: coconut
+  use_lsp_jepa: true
+  run_kind: lsp_core_step_trajectory_from_coconut_full_latent
+
+initialization:
+  coconut_checkpoint: /root/autodl-tmp/simcot_coconut/ckpts/gsm_coconut_from_best_accuracy_cachefix2_bs32_restart_20260513_110520/best_full_latent_eval_accuracy.json
+
+runtime:
+  model_id: /root/autodl-tmp/hf_cache/hub/models--openai-community--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e
+  device: auto
+  seed: 0
+
+data:
+  autodl_root: /root/autodl-tmp
+  cache_dir: /root/autodl-tmp/lsp_jepa/data
+  local_dataset_path: /root/autodl-tmp/lsp_jepa/data/gsm8k_aug_train.jsonl
+  dataset_source: gsm8k_aug
+  dataset_id: zen-E/GSM8k-Aug
+  dataset_config: main
+  dataset_split: train
+  hf_endpoint: https://hf-mirror.com
+  expected_samples: 385531
+  max_samples: null
+  data_path: null
+  max_teacher_length: 512
+  min_samples: 385531
+
+training:
+  script: lsp_jepa/scripts/train_lsp_jepa_core.py
+  output_dir: /root/autodl-tmp/lsp_jepa/runs/lsp_step_trajectory_from_coconut_full_latent/steptraj_from_coconut_full_latent_aw02_ce05_warmup10_20260515
+  metrics_path: null
+  summary_path: null
+  config_snapshot_path: null
+  checkpoint_dir: null
+  log_dir: /root/autodl-tmp/lsp_jepa/runs/lsp_step_trajectory_from_coconut_full_latent/steptraj_from_coconut_full_latent_aw02_ce05_warmup10_20260515/logs
+  save_checkpoints: true
+  max_steps: 64260
+  batch_size: 24
+  save_every: 3213
+  save_every_epoch: true
+  keep_last_checkpoints: 2
+  keep_best_total_loss: true
+  log_every: 10
+  tqdm_progress: true
+  lr: 0.00005
+  weight_decay: 0.0
+  drop_last: false
+  shuffle: true
+  effective_rank_every: 3213
+
+teacher:
+  ema_decay: 0.995
+  update_trainable_only: true
+  output_hidden_states: true
+  target_layer: last_2
+  target_pooling: step_last_token
+  target_space: raw_hidden
+  target_position: all_valid_reasoning_step_boundaries
+  exclude_answer_tokens: true
+  exclude_answer_prefix: true
+  reasoning_step_filter: exclude_answer_only_steps
+
+student:
+  latent_arch: latent_tokens
+  num_latent_steps: 4
+  latent_dim: null
+  normalize_latents: true
+  detach_between_steps: false
+
+lsp_objective:
+  objective: lsp_state
+  type: step_trajectory
+  state_offset: 0
+  transition_weight: 0.0
+
+mapping:
+  strategy: one_to_one
+  sparse_positions: [first, middle, final]
+  attention_coverage_weight: 0.0
+
+loss:
+  alignment: mse
+  align_weight: 0.2
+  lsp_weight_warmup_ratio: 0.10
+  lsp_weight_warmup_steps: 0
+  anti_collapse: variance
+  anti_collapse_weight: 0.01
+  answer_readout_weight: 0.0
+
+host_losses:
+  host_answer_ce_weight: 0.5
+  codi_distill_weight: 0.0
+  simcot_decoder_weight: 0.0
+  intermediate_cot_ce_weight: 0.0
+
+logging:
+  log_latent_metrics: true
+  log_alignment_matrices: false
+  log_target_leakage_checks: true
+  log_host_losses: true
+  console_json_every: 0
+  effective_rank_every: 3213
+
+eval:
+  every_epoch: true
+  every_steps: 0
+  output_dir: null
+  metrics_path: null
+  eval_json: /root/autodl-tmp/lsp_jepa/data/gsm8k_aug_test.jsonl
+  eval_split: test
+  dataset_id: openai/gsm8k
+  dataset_config: main
+  expected_samples: 1319
+  limit_samples: 0
+  max_new_tokens: 32
+  save_examples: 5
+
+optimization_contract:
+  no_step_level_training: false
+  step_trajectory_training: true
+  no_adapter_expansion: true
+  single_backward_per_batch: true
+  ema_update_after_optimizer_step: true
+  allow_empty_latents: false
+  allow_empty_teacher_targets: false

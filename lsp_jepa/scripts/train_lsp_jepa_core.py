@@ -285,12 +285,31 @@ def main() -> None:
         raise ValueError("--max-steps must be at least 1")
     if args.num_latent_steps < 1:
         raise ValueError("--num-latent-steps must be at least 1")
+    if args.eval_num_latent_steps < 0:
+        raise ValueError("--eval-num-latent-steps must be non-negative")
+    if args.latent_tokens_per_teacher_step < 1:
+        raise ValueError("--latent-tokens-per-teacher-step must be at least 1")
+    if args.max_teacher_step_groups < 0:
+        raise ValueError("--max-teacher-step-groups must be non-negative")
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1")
     if args.min_samples < 1:
         raise ValueError("--min-samples must be at least 1")
     if args.effective_rank_every < 0:
         raise ValueError("--effective-rank-every must be non-negative")
+    if args.lsp_weight_warmup_ratio < 0.0:
+        raise ValueError("--lsp-weight-warmup-ratio must be non-negative")
+    if args.lsp_weight_warmup_steps < 0:
+        raise ValueError("--lsp-weight-warmup-steps must be non-negative")
+    if args.exit_after_eval_before_train and not args.eval_before_train:
+        raise ValueError("--exit-after-eval-before-train requires --eval-before-train")
+    if args.init_coconut_checkpoint is not None and args.resume_from_checkpoint is not None:
+        # Resuming restores the student, EMA teacher, and optimizer states.
+        # Configs for continuation runs still record the original Coconut init
+        # checkpoint, so resume must take precedence over fresh initialization.
+        args.init_coconut_checkpoint = None
+    prepare_lsp_weight_warmup(args)
+    prepare_eval_num_latent_steps(args)
 
     distributed = init_distributed_context(args.device)
     torch.manual_seed(args.seed + distributed.rank)
@@ -303,6 +322,7 @@ def main() -> None:
         device = torch.device("cuda", distributed.local_rank)
     normalize_output_paths(args)
     configure_data_cache(args)
+    prepare_coconut_initialization(args)
     samples = load_samples(args)
     if len(samples) < args.min_samples:
         raise RuntimeError(
@@ -328,7 +348,11 @@ def main() -> None:
 
     tokenizer, base_model = build_tokenizer_and_model(args, samples)
     base_model.to(device)
-    epoch_eval_samples = load_epoch_eval_samples(args) if args.eval_every > 0 else []
+    epoch_eval_samples = (
+        load_epoch_eval_samples(args)
+        if args.eval_every > 0 or args.eval_before_train
+        else []
+    )
     if isinstance(tokenizer, MinimalTokenizer) and epoch_eval_samples:
         warm_tokenizer_vocab(tokenizer, list(epoch_eval_samples), args)
         base_model.resize_token_embeddings(len(tokenizer))
@@ -346,6 +370,14 @@ def main() -> None:
     ).to(device)
     student_core = student
     student_core.train()
+    if args.resolved_init_coconut_checkpoint is not None:
+        init_load_info = load_coconut_initial_checkpoint(
+            Path(args.resolved_init_coconut_checkpoint),
+            student=student_core,
+            device=device,
+        )
+        args.init_coconut_loaded_key_count = init_load_info["loaded_keys"]
+        args.init_coconut_load_target = init_load_info["load_target"]
     if distributed.enabled:
         student = DistributedDataParallel(
             student_core,
@@ -381,7 +413,7 @@ def main() -> None:
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         config_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        if args.eval_every > 0:
+        if args.eval_every > 0 or args.eval_before_train:
             eval_output_dir.mkdir(parents=True, exist_ok=True)
             if eval_metrics_path.exists() and not args.append_metrics:
                 eval_metrics_path.unlink()
@@ -425,6 +457,32 @@ def main() -> None:
             distributed_barrier(distributed)
             cleanup_distributed(distributed)
             return
+    if args.eval_before_train and start_step == 0:
+        if is_main_process(distributed):
+            maybe_run_epoch_eval(
+                args,
+                step=0,
+                student=student_core,
+                tokenizer=tokenizer,
+                eval_samples=epoch_eval_samples,
+                checkpoint_path=(
+                    Path(args.resolved_init_coconut_checkpoint)
+                    if args.resolved_init_coconut_checkpoint is not None
+                    else None
+                ),
+                eval_output_dir=eval_output_dir,
+                eval_metrics_path=eval_metrics_path,
+                device=device,
+                force=True,
+                extra_metrics={
+                    "is_step0_baseline": True,
+                    "baseline_checkpoint_path": args.resolved_init_coconut_checkpoint,
+                },
+            )
+        distributed_barrier(distributed)
+        if args.exit_after_eval_before_train:
+            cleanup_distributed(distributed)
+            return
     batch_iter = iter_train_batches(
         train_loader,
         start_epoch=start_step // args.epoch_steps,
@@ -435,8 +493,21 @@ def main() -> None:
     adapter = CoconutLSPAdapter(latent_token_id=latent_id)
     metrics_history: list[dict[str, Any]] = []
     seen_sample_indices: set[int] = set()
-    best_total_loss: float | None = None
-    best_checkpoint_path: Path | None = None
+    best_total_loss, best_checkpoint_path = load_best_checkpoint_metric(
+        checkpoint_dir / "best_total_loss.json",
+        "total_loss",
+    )
+    best_eval_accuracy, best_eval_checkpoint_path = load_best_checkpoint_metric(
+        checkpoint_dir / "best_eval_accuracy.json",
+        "accuracy",
+    )
+    (
+        best_post_warmup_eval_accuracy,
+        best_post_warmup_eval_checkpoint_path,
+    ) = load_best_checkpoint_metric(
+        checkpoint_dir / "best_post_warmup_eval_accuracy.json",
+        "accuracy",
+    )
     progress = build_tqdm_progress(args, initial=start_step) if is_main_process(distributed) else None
 
     for train_step in range(start_step + 1, args.max_steps + 1):
@@ -495,7 +566,7 @@ def main() -> None:
             host_output.latent_mask,
             teacher_targets.target_states,
             teacher_targets.target_mask,
-            objective=args.objective,
+            args=args,
             alignment=args.alignment_loss,
         )
 
@@ -516,21 +587,22 @@ def main() -> None:
         host_answer_ce = host_output.host_losses.get("host_answer_ce")
         if host_answer_ce is None:
             raise RuntimeError("Coconut host output did not provide host_answer_ce")
+        effective_lsp_weight = lsp_weight_for_step(args, train_step)
+        lsp_weight_progress = lsp_weight_warmup_progress(args, train_step)
         anti_collapse_loss = compute_anti_collapse_loss(
-            aligned_student,
-            alignment_mask,
+            host_output.latent_states,
+            host_output.latent_mask,
             method=args.anti_collapse_type,
             weight=args.anti_collapse_weight,
         )
-        total_loss = (
-            args.lsp_weight * lsp_loss
-            + args.host_answer_ce_weight * host_answer_ce
-            + anti_collapse_loss
-        )
+        weighted_lsp_loss = effective_lsp_weight * lsp_loss
+        weighted_host_answer_ce = args.host_answer_ce_weight * host_answer_ce
+        total_loss = weighted_lsp_loss + weighted_host_answer_ce + anti_collapse_loss
         latent_variance = per_dim_variance(aligned_student, alignment_mask)
         raw_latent_variance = per_dim_variance(host_output.latent_states, host_output.latent_mask)
         pairwise = pairwise_cosine_summary(aligned_student, alignment_mask)
         pairwise_l2_mean = pairwise_l2(aligned_student, alignment_mask)
+        compute_effective_rank = should_compute_effective_rank(args, train_step)
         (
             latent_effective_rank,
             latent_effective_rank_status,
@@ -538,10 +610,25 @@ def main() -> None:
         ) = effective_rank_diagnostic(
             aligned_student,
             alignment_mask,
-            compute=should_compute_effective_rank(args, train_step),
+            compute=compute_effective_rank,
+        )
+        (
+            all_latent_effective_rank,
+            all_latent_effective_rank_status,
+            all_latent_effective_rank_error,
+        ) = effective_rank_diagnostic(
+            host_output.latent_states,
+            host_output.latent_mask,
+            compute=compute_effective_rank,
         )
         answer_ce_terms = answer_ce_terms_in_total(args, host_answer_ce)
         answer_ce_double_count_ok = len(answer_ce_terms) <= 1
+        weighted_lsp_loss_value = to_float(weighted_lsp_loss)
+        weighted_host_answer_ce_value = to_float(weighted_host_answer_ce)
+        lsp_to_ce_ratio = safe_float_ratio(
+            weighted_lsp_loss_value,
+            weighted_host_answer_ce_value,
+        )
 
         validate_finite("total_loss", total_loss)
         validate_finite("lsp_loss", lsp_loss)
@@ -584,25 +671,97 @@ def main() -> None:
             )
         if checkpoint_path is not None:
             total_loss_value = to_float(total_loss)
+            write_checkpoint_alias(
+                checkpoint_dir,
+                alias_name="latest.pt",
+                checkpoint_path=checkpoint_path,
+                metadata={
+                    "step": train_step,
+                    "total_loss": total_loss_value,
+                    "purpose": "latest checkpoint for resume",
+                },
+            )
             if args.keep_best_total_loss and (
                 best_total_loss is None or total_loss_value < best_total_loss
             ):
                 best_total_loss = total_loss_value
-                best_checkpoint_path = checkpoint_path
-                write_json(
-                    checkpoint_dir / "best_total_loss.json",
-                    {
-                        "step": train_step,
+                best_checkpoint_path = write_checkpoint_alias(
+                    checkpoint_dir,
+                    alias_name="best_total_loss.pt",
+                    checkpoint_path=checkpoint_path,
+                    metadata={
+                        **checkpoint_epoch_metadata(train_step, args.epoch_steps),
                         "total_loss": best_total_loss,
-                        "checkpoint_path": str(best_checkpoint_path),
+                        "purpose": "lowest training total_loss checkpoint",
                     },
                 )
             prune_old_checkpoints(
                 checkpoint_dir,
                 keep_last=args.keep_last_checkpoints,
-                keep_paths=[best_checkpoint_path] if best_checkpoint_path is not None else [],
+                keep_paths=[
+                    path
+                    for path in (
+                        best_checkpoint_path,
+                        best_eval_checkpoint_path,
+                        best_post_warmup_eval_checkpoint_path,
+                    )
+                    if path is not None
+                ],
             )
         epoch_eval = None
+        post_warmup_eval_eligible = is_post_lsp_weight_warmup_epoch(args, train_step)
+        epoch_train_diagnostics = {
+            "effective_rank": (
+                to_float(latent_effective_rank)
+                if latent_effective_rank is not None
+                else None
+            ),
+            "effective_rank_aligned": (
+                to_float(latent_effective_rank)
+                if latent_effective_rank is not None
+                else None
+            ),
+            "effective_rank_all_latents": (
+                to_float(all_latent_effective_rank)
+                if all_latent_effective_rank is not None
+                else None
+            ),
+            "effective_rank_status": latent_effective_rank_status,
+            "effective_rank_error": latent_effective_rank_error,
+            "effective_rank_aligned_status": latent_effective_rank_status,
+            "effective_rank_aligned_error": latent_effective_rank_error,
+            "effective_rank_all_latents_status": all_latent_effective_rank_status,
+            "effective_rank_all_latents_error": all_latent_effective_rank_error,
+            "effective_rank_every": args.effective_rank_every,
+            "latent_variance_mean": to_float(latent_variance["mean"]),
+            "latent_variance_min": to_float(latent_variance["min"]),
+            "latent_variance_max": to_float(latent_variance["max"]),
+            "raw_latent_variance_mean": to_float(raw_latent_variance["mean"]),
+            "all_latent_variance_mean": to_float(raw_latent_variance["mean"]),
+            "pairwise_cosine_mean": to_float(pairwise["mean"]),
+            "pairwise_cosine_min": to_float(pairwise["min"]),
+            "pairwise_cosine_max": to_float(pairwise["max"]),
+            "pairwise_l2_mean": to_float(pairwise_l2_mean),
+            "anti_collapse_type": args.anti_collapse_type,
+            "anti_collapse_weight": args.anti_collapse_weight,
+            "anti_collapse_scope": "all_student_latents",
+            "anti_collapse_loss": to_float(anti_collapse_loss),
+            "lsp_loss": to_float(lsp_loss),
+            "weighted_lsp_loss": weighted_lsp_loss_value,
+            "host_answer_ce": to_float(host_answer_ce),
+            "weighted_host_answer_ce": weighted_host_answer_ce_value,
+            "lsp_to_ce_ratio": lsp_to_ce_ratio,
+            "lsp_weight": effective_lsp_weight,
+            "lsp_weight_target": args.lsp_weight,
+            "lsp_weight_warmup_progress": lsp_weight_progress,
+            "post_warmup_eval_eligible": post_warmup_eval_eligible,
+            "mapping_strategy": args.mapping_strategy,
+            "latent_count_mode": args.latent_count_mode,
+            "latent_tokens_per_teacher_step": args.latent_tokens_per_teacher_step,
+            "max_teacher_step_groups": max_teacher_step_groups_for_args(args),
+            "teacher_step_selection": args.teacher_step_selection,
+            "eval_num_latent_steps": args.resolved_eval_num_latent_steps,
+        }
         if is_main_process(distributed):
             epoch_eval = maybe_run_epoch_eval(
                 args,
@@ -614,7 +773,40 @@ def main() -> None:
                 eval_output_dir=eval_output_dir,
                 eval_metrics_path=eval_metrics_path,
                 device=device,
+                training_diagnostics=epoch_train_diagnostics,
             )
+            if epoch_eval is not None and checkpoint_path is not None:
+                eval_accuracy = float(epoch_eval["accuracy"])
+                if best_eval_accuracy is None or eval_accuracy > best_eval_accuracy:
+                    best_eval_accuracy = eval_accuracy
+                    best_eval_checkpoint_path = write_checkpoint_alias(
+                        checkpoint_dir,
+                        alias_name="best_eval_accuracy.pt",
+                        checkpoint_path=checkpoint_path,
+                        metadata={
+                            **checkpoint_epoch_metadata(train_step, args.epoch_steps),
+                            "accuracy": best_eval_accuracy,
+                            "exact_match": epoch_eval["exact_match"],
+                            "invalid_answer_rate": epoch_eval["invalid_answer_rate"],
+                            "num_eval_samples": epoch_eval["num_eval_samples"],
+                            "eval_metrics_path": epoch_eval["metrics_path"],
+                            "step_metrics_path": epoch_eval["step_metrics_path"],
+                            "purpose": "highest eval accuracy checkpoint",
+                        },
+                    )
+                (
+                    best_post_warmup_eval_accuracy,
+                    best_post_warmup_eval_checkpoint_path,
+                    _updated_post_warmup_eval_checkpoint,
+                ) = maybe_update_best_post_warmup_eval_checkpoint(
+                    args,
+                    checkpoint_dir=checkpoint_dir,
+                    checkpoint_path=checkpoint_path,
+                    step=train_step,
+                    epoch_eval=epoch_eval,
+                    best_accuracy=best_post_warmup_eval_accuracy,
+                    best_checkpoint_path=best_post_warmup_eval_checkpoint_path,
+                )
         distributed_barrier(distributed)
 
         if not is_main_process(distributed):
@@ -627,7 +819,7 @@ def main() -> None:
             "backbone": "coconut",
             "objective": "lsp_state",
             "training_objective": args.objective,
-            "mapping": "one_to_one" if args.objective == "step_trajectory" else "sequence",
+            "mapping": args.mapping_strategy if args.objective == "step_trajectory" else "sequence",
             "target_position": (
                 "all_valid_reasoning_step_boundaries"
                 if args.objective == "step_trajectory"
@@ -636,6 +828,12 @@ def main() -> None:
             "no_step_level_training": args.objective != "step_trajectory",
             "step_trajectory_training": args.objective == "step_trajectory",
             "no_adapter_expansion": True,
+            "mapping_strategy": args.mapping_strategy,
+            "latent_count_mode": args.latent_count_mode,
+            "latent_tokens_per_teacher_step": args.latent_tokens_per_teacher_step,
+            "max_teacher_step_groups": max_teacher_step_groups_for_args(args),
+            "teacher_step_selection": args.teacher_step_selection,
+            "eval_num_latent_steps": args.resolved_eval_num_latent_steps,
             "sample_count": len(samples),
             "expected_samples": args.expected_samples,
             "full_train_dataloader": True,
@@ -650,6 +848,19 @@ def main() -> None:
             "checkpoint_keep_last": args.keep_last_checkpoints,
             "best_total_loss": best_total_loss,
             "best_checkpoint_path": str(best_checkpoint_path) if best_checkpoint_path is not None else None,
+            "best_eval_accuracy": best_eval_accuracy,
+            "best_eval_checkpoint_path": (
+                str(best_eval_checkpoint_path)
+                if best_eval_checkpoint_path is not None
+                else None
+            ),
+            "best_post_warmup_eval_accuracy": best_post_warmup_eval_accuracy,
+            "best_post_warmup_eval_checkpoint_path": (
+                str(best_post_warmup_eval_checkpoint_path)
+                if best_post_warmup_eval_checkpoint_path is not None
+                else None
+            ),
+            "post_warmup_eval_eligible": post_warmup_eval_eligible,
             "epoch_steps": args.epoch_steps,
             "epoch_index": epoch_index(train_step, args.epoch_steps),
             "unique_samples_seen": len(seen_sample_indices),
@@ -664,11 +875,19 @@ def main() -> None:
             "batch_sample_ids": [sample.sample_id or sample.source for sample in batch_samples],
             "total_loss": to_float(total_loss),
             "lsp_loss": to_float(lsp_loss),
+            "weighted_lsp_loss": weighted_lsp_loss_value,
             "host_answer_ce": to_float(host_answer_ce),
+            "weighted_host_answer_ce": weighted_host_answer_ce_value,
+            "lsp_to_ce_ratio": lsp_to_ce_ratio,
             "host_answer_ce_weight": args.host_answer_ce_weight,
-            "lsp_weight": args.lsp_weight,
+            "lsp_weight": effective_lsp_weight,
+            "lsp_weight_target": args.lsp_weight,
+            "lsp_weight_warmup_ratio": args.lsp_weight_warmup_ratio,
+            "lsp_weight_warmup_steps": args.resolved_lsp_weight_warmup_steps,
+            "lsp_weight_warmup_progress": lsp_weight_progress,
             "anti_collapse_type": args.anti_collapse_type,
             "anti_collapse_weight": args.anti_collapse_weight,
+            "anti_collapse_scope": "all_student_latents",
             "anti_collapse_loss": to_float(anti_collapse_loss),
             "answer_ce_terms_in_total": answer_ce_terms,
             "answer_ce_double_count_ok": answer_ce_double_count_ok,
@@ -677,13 +896,28 @@ def main() -> None:
             "latent_variance_min": to_float(latent_variance["min"]),
             "latent_variance_max": to_float(latent_variance["max"]),
             "raw_latent_variance_mean": to_float(raw_latent_variance["mean"]),
+            "all_latent_variance_mean": to_float(raw_latent_variance["mean"]),
             "effective_rank": (
                 to_float(latent_effective_rank)
                 if latent_effective_rank is not None
                 else None
             ),
+            "effective_rank_aligned": (
+                to_float(latent_effective_rank)
+                if latent_effective_rank is not None
+                else None
+            ),
+            "effective_rank_all_latents": (
+                to_float(all_latent_effective_rank)
+                if all_latent_effective_rank is not None
+                else None
+            ),
             "effective_rank_status": latent_effective_rank_status,
             "effective_rank_error": latent_effective_rank_error,
+            "effective_rank_aligned_status": latent_effective_rank_status,
+            "effective_rank_aligned_error": latent_effective_rank_error,
+            "effective_rank_all_latents_status": all_latent_effective_rank_status,
+            "effective_rank_all_latents_error": all_latent_effective_rank_error,
             "effective_rank_every": args.effective_rank_every,
             "pairwise_cosine": to_float(pairwise["mean"]),
             "pairwise_cosine_mean": to_float(pairwise["mean"]),
@@ -786,10 +1020,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--objective", default="sequence")
     parser.add_argument("--lsp-weight", type=float, default=1.0)
+    parser.add_argument("--lsp-weight-warmup-ratio", type=float, default=0.0)
+    parser.add_argument("--lsp-weight-warmup-steps", type=int, default=0)
     parser.add_argument("--host-answer-ce-weight", type=float, default=0.1)
     parser.add_argument("--ema-decay", type=float, default=0.995)
     parser.add_argument("--target-layer", default="last_2")
     parser.add_argument("--num-latent-steps", type=int, default=4)
+    parser.add_argument(
+        "--mapping-strategy",
+        default="one_to_one",
+        choices=("one_to_one", "grouped_step_end", "sequence"),
+        help="Student-to-teacher latent state mapping used by the LSP objective.",
+    )
+    parser.add_argument(
+        "--latent-count-mode",
+        default="teacher_steps",
+        choices=("teacher_steps", "fixed_full"),
+        help=(
+            "For step trajectory training, teacher_steps uses one latent per "
+            "teacher step; fixed_full always uses --num-latent-steps."
+        ),
+    )
+    parser.add_argument(
+        "--latent-tokens-per-teacher-step",
+        type=int,
+        default=1,
+        help="Student latent-token group size used by grouped step mapping.",
+    )
+    parser.add_argument(
+        "--max-teacher-step-groups",
+        type=int,
+        default=0,
+        help=(
+            "Maximum teacher boundaries aligned in grouped step mapping; "
+            "0 derives the limit from latent steps and group size."
+        ),
+    )
+    parser.add_argument(
+        "--teacher-step-selection",
+        default="all",
+        choices=("all", "uniform_first_last"),
+        help="How to compress teacher boundaries when there are more than the grouped budget.",
+    )
     parser.add_argument("--max-teacher-length", type=int, default=512)
     parser.add_argument("--alignment-loss", default="normalized_mse")
     parser.add_argument("--anti-collapse-type", default="variance")
@@ -802,6 +1074,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--append-metrics", action="store_true")
+    parser.add_argument(
+        "--init-coconut-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Initialize the Coconut student from a Coconut baseline checkpoint "
+            "before creating the EMA teacher. Accepts a raw .pt checkpoint or "
+            "a metadata .json containing checkpoint_path."
+        ),
+    )
     parser.add_argument(
         "--resume-from-checkpoint",
         type=Path,
@@ -874,6 +1156,17 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Override --eval-every with the computed steps per full training epoch.",
     )
+    parser.add_argument(
+        "--eval-before-train",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run a step-0 final-answer eval before the first optimizer step.",
+    )
+    parser.add_argument(
+        "--exit-after-eval-before-train",
+        action="store_true",
+        help="Run the step-0 eval and exit without training; useful for backfilling baselines.",
+    )
     parser.add_argument("--eval-output-dir", default=None)
     parser.add_argument("--eval-metrics-path", default=None)
     parser.add_argument("--eval-json", type=Path)
@@ -882,6 +1175,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-dataset-config", default="main")
     parser.add_argument("--eval-expected-samples", type=int, default=1319)
     parser.add_argument("--eval-limit-samples", type=int, default=20)
+    parser.add_argument(
+        "--eval-num-latent-steps",
+        type=int,
+        default=0,
+        help="Latent-token count for final-answer eval; 0 falls back to --num-latent-steps.",
+    )
     parser.add_argument("--eval-max-new-tokens", type=int, default=32)
     parser.add_argument("--eval-save-examples", type=int, default=5)
     parser.add_argument("--tqdm-progress", action=argparse.BooleanOptionalAction, default=True)
@@ -955,6 +1254,7 @@ def apply_config(
     set_from_config(args, provided_flags, "effective_rank_every", config_get(config, "training.effective_rank_every"))
     set_from_config(args, provided_flags, "eval_every", config_get(config, "eval.every_steps"))
     set_from_config(args, provided_flags, "eval_every_epoch", config_get(config, "eval.every_epoch"))
+    set_from_config(args, provided_flags, "eval_before_train", config_get(config, "eval.before_train"))
     set_from_config(args, provided_flags, "eval_output_dir", config_get(config, "eval.output_dir"))
     set_from_config(args, provided_flags, "eval_metrics_path", config_get(config, "eval.metrics_path"))
     set_from_config(args, provided_flags, "eval_json", config_get(config, "eval.eval_json"), path=True)
@@ -963,6 +1263,7 @@ def apply_config(
     set_from_config(args, provided_flags, "eval_dataset_config", config_get(config, "eval.dataset_config"))
     set_from_config(args, provided_flags, "eval_expected_samples", config_get(config, "eval.expected_samples"))
     set_from_config(args, provided_flags, "eval_limit_samples", config_get(config, "eval.limit_samples"))
+    set_from_config(args, provided_flags, "eval_num_latent_steps", config_get(config, "eval.num_latent_steps"))
     set_from_config(args, provided_flags, "eval_max_new_tokens", config_get(config, "eval.max_new_tokens"))
     set_from_config(args, provided_flags, "eval_save_examples", config_get(config, "eval.save_examples"))
     set_from_config(args, provided_flags, "log_every", config_get(config, "training.log_every"))
@@ -1014,15 +1315,39 @@ def apply_config(
     if "include_answer_prefix" not in provided_flags and exclude_answer_prefix is not None:
         args.include_answer_prefix = not bool(exclude_answer_prefix)
     set_from_config(args, provided_flags, "num_latent_steps", config_get(config, "student.num_latent_steps"))
+    set_from_config(args, provided_flags, "latent_count_mode", config_get(config, "student.latent_count_mode"))
+    set_from_config(
+        args,
+        provided_flags,
+        "init_coconut_checkpoint",
+        config_get(config, "initialization.coconut_checkpoint"),
+        path=True,
+    )
     objective_type = config_get(config, "lsp_objective.type")
     mapping_strategy = config_get(config, "mapping.strategy")
+    set_from_config(args, provided_flags, "mapping_strategy", mapping_strategy)
     if "objective" not in provided_flags:
-        if objective_type == "step_trajectory" or mapping_strategy == "one_to_one":
+        if objective_type == "step_trajectory" or mapping_strategy in {"one_to_one", "grouped_step_end"}:
             args.objective = "step_trajectory"
         elif objective_type == "state":
             args.objective = "sequence"
+    set_from_config(args, provided_flags, "latent_tokens_per_teacher_step", config_get(config, "mapping.latent_tokens_per_teacher_step"))
+    set_from_config(args, provided_flags, "max_teacher_step_groups", config_get(config, "mapping.max_teacher_step_groups"))
+    set_from_config(args, provided_flags, "teacher_step_selection", config_get(config, "mapping.teacher_step_selection"))
     set_from_config(args, provided_flags, "alignment_loss", config_get(config, "loss.alignment"))
     set_from_config(args, provided_flags, "lsp_weight", config_get(config, "loss.align_weight"))
+    set_from_config(
+        args,
+        provided_flags,
+        "lsp_weight_warmup_ratio",
+        config_get(config, "loss.lsp_weight_warmup_ratio"),
+    )
+    set_from_config(
+        args,
+        provided_flags,
+        "lsp_weight_warmup_steps",
+        config_get(config, "loss.lsp_weight_warmup_steps"),
+    )
     anti_collapse = config_get(config, "loss.anti_collapse")
     if anti_collapse is None:
         anti_collapse = config_get(config, "loss.anti_collapse_type")
@@ -1580,14 +1905,78 @@ def epoch_index(step: int, epoch_steps: int) -> int:
     return math.ceil(step / epoch_steps)
 
 
+def checkpoint_epoch_metadata(step: int, epoch_steps: int) -> dict[str, int | str]:
+    index = epoch_index(step, epoch_steps)
+    if epoch_steps > 0 and step % epoch_steps == 0:
+        epoch_step = epoch_steps
+    elif epoch_steps > 0:
+        epoch_step = step % epoch_steps
+    else:
+        epoch_step = step
+    return {
+        "step": step,
+        "global_step": step,
+        "epoch_index": index,
+        "epoch_step": epoch_step,
+        "epoch_steps": epoch_steps,
+        "epoch_label": f"epoch_{index:04d}",
+        "checkpoint_label": f"epoch_{index:04d}_step_{step:06d}",
+    }
+
+
 def latent_counts_for_objective(
     teacher_targets: TeacherTargetBatch,
     args: argparse.Namespace,
 ) -> list[int]:
+    batch_size = int(teacher_targets.target_mask.shape[0])
+    if args.objective == "step_trajectory" and args.latent_count_mode == "fixed_full":
+        return [int(args.num_latent_steps)] * batch_size
     if args.objective == "step_trajectory":
         counts = teacher_targets.target_mask.to(dtype=torch.long).sum(dim=1)
         return [max(1, int(count.detach().cpu().item())) for count in counts]
-    return [int(args.num_latent_steps)] * int(teacher_targets.target_mask.shape[0])
+    return [int(args.num_latent_steps)] * batch_size
+
+
+def max_teacher_step_groups_for_args(args: argparse.Namespace) -> int:
+    if int(args.max_teacher_step_groups) > 0:
+        return int(args.max_teacher_step_groups)
+    return max(1, int(args.num_latent_steps) // int(args.latent_tokens_per_teacher_step))
+
+
+def select_teacher_step_indices(
+    valid_count: int,
+    *,
+    max_groups: int,
+    selection: str,
+) -> list[int]:
+    if valid_count <= 0 or max_groups <= 0:
+        return []
+    if valid_count <= max_groups:
+        return list(range(valid_count))
+    if selection == "all":
+        return list(range(max_groups))
+    if selection != "uniform_first_last":
+        raise ValueError(f"unsupported teacher step selection: {selection}")
+    if max_groups == 1:
+        return [valid_count - 1]
+    indices = [
+        int(round(position * (valid_count - 1) / (max_groups - 1)))
+        for position in range(max_groups)
+    ]
+    selected: list[int] = []
+    for index in indices:
+        clamped = max(0, min(valid_count - 1, index))
+        if clamped not in selected:
+            selected.append(clamped)
+    candidate = 0
+    while len(selected) < max_groups and candidate < valid_count:
+        if candidate not in selected:
+            selected.append(candidate)
+        candidate += 1
+    selected = sorted(selected[:max_groups])
+    selected[0] = 0
+    selected[-1] = valid_count - 1
+    return selected
 
 
 def align_student_teacher_states(
@@ -1596,10 +1985,15 @@ def align_student_teacher_states(
     teacher_states: torch.Tensor,
     teacher_mask: torch.Tensor,
     *,
-    objective: str,
-    alignment: str,
+    args: argparse.Namespace | None = None,
+    objective: str | None = None,
+    alignment: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     del alignment
+    if args is not None:
+        objective = args.objective
+    if objective is None:
+        raise ValueError("objective is required")
     teacher_states = teacher_states.to(device=student_states.device, dtype=student_states.dtype).detach()
     teacher_mask = teacher_mask.to(device=student_states.device, dtype=torch.bool)
     student_mask = student_mask.to(device=student_states.device, dtype=torch.bool)
@@ -1609,6 +2003,56 @@ def align_student_teacher_states(
         return h_final, z_final, h_final_mask & z_final_mask
     if objective != "step_trajectory":
         raise ValueError(f"unsupported objective: {objective}")
+    mapping_strategy = getattr(args, "mapping_strategy", "one_to_one") if args is not None else "one_to_one"
+    if mapping_strategy == "grouped_step_end":
+        group_size = int(getattr(args, "latent_tokens_per_teacher_step", 1))
+        max_groups = max_teacher_step_groups_for_args(args) if args is not None else 0
+        student_group_budget = int(student_states.shape[1]) // group_size
+        group_count = min(student_group_budget, max_groups)
+        if group_count < 1:
+            raise ValueError("grouped_step_end requires at least one complete latent group")
+        hidden_dim = int(student_states.shape[-1])
+        aligned_student = student_states.new_zeros((student_states.shape[0], group_count, hidden_dim))
+        aligned_teacher = teacher_states.new_zeros((student_states.shape[0], group_count, hidden_dim))
+        aligned_mask = torch.zeros(
+            (student_states.shape[0], group_count),
+            dtype=torch.bool,
+            device=student_states.device,
+        )
+        group_end_indices = torch.arange(
+            group_size - 1,
+            group_size * group_count,
+            group_size,
+            device=student_states.device,
+        )
+        selection = getattr(args, "teacher_step_selection", "all") if args is not None else "all"
+        for batch_index in range(student_states.shape[0]):
+            valid_teacher_indices = torch.nonzero(
+                teacher_mask[batch_index],
+                as_tuple=False,
+            ).flatten()
+            selected_relative = select_teacher_step_indices(
+                int(valid_teacher_indices.numel()),
+                max_groups=group_count,
+                selection=selection,
+            )
+            if not selected_relative:
+                continue
+            selected_teacher_indices = valid_teacher_indices[
+                torch.tensor(selected_relative, dtype=torch.long, device=student_states.device)
+            ]
+            align_count = min(int(selected_teacher_indices.numel()), int(group_end_indices.numel()))
+            if align_count < 1:
+                continue
+            student_indices = group_end_indices[:align_count]
+            teacher_indices = selected_teacher_indices[:align_count]
+            aligned_student[batch_index, :align_count, :] = student_states[batch_index, student_indices, :]
+            aligned_teacher[batch_index, :align_count, :] = teacher_states[batch_index, teacher_indices, :]
+            aligned_mask[batch_index, :align_count] = (
+                student_mask[batch_index, student_indices]
+                & teacher_mask[batch_index, teacher_indices]
+            )
+        return aligned_student, aligned_teacher, aligned_mask
     steps = min(student_states.shape[1], teacher_states.shape[1])
     aligned_student = student_states[:, :steps, :]
     aligned_teacher = teacher_states[:, :steps, :]
@@ -1755,6 +2199,210 @@ def model_hidden_size(model: nn.Module) -> int:
     return int(embeddings.embedding_dim)
 
 
+def prepare_lsp_weight_warmup(args: argparse.Namespace) -> None:
+    if args.lsp_weight_warmup_steps > 0:
+        warmup_steps = int(args.lsp_weight_warmup_steps)
+    elif args.lsp_weight_warmup_ratio > 0.0:
+        warmup_steps = int(math.ceil(args.max_steps * args.lsp_weight_warmup_ratio))
+    else:
+        warmup_steps = 0
+    args.resolved_lsp_weight_warmup_steps = warmup_steps
+
+
+def prepare_eval_num_latent_steps(args: argparse.Namespace) -> None:
+    args.resolved_eval_num_latent_steps = (
+        int(args.eval_num_latent_steps)
+        if int(args.eval_num_latent_steps) > 0
+        else int(args.num_latent_steps)
+    )
+
+
+def lsp_weight_warmup_progress(args: argparse.Namespace, step: int) -> float:
+    warmup_steps = int(getattr(args, "resolved_lsp_weight_warmup_steps", 0) or 0)
+    if warmup_steps <= 0:
+        return 1.0
+    return min(1.0, max(0.0, (int(step) - 1) / warmup_steps))
+
+
+def lsp_weight_for_step(args: argparse.Namespace, step: int) -> float:
+    return float(args.lsp_weight) * lsp_weight_warmup_progress(args, step)
+
+
+def is_post_lsp_weight_warmup_epoch(args: argparse.Namespace, step: int) -> bool:
+    warmup_steps = int(getattr(args, "resolved_lsp_weight_warmup_steps", 0) or 0)
+    if warmup_steps <= 0:
+        return True
+    return int(step) > warmup_steps
+
+
+def maybe_update_best_post_warmup_eval_checkpoint(
+    args: argparse.Namespace,
+    *,
+    checkpoint_dir: Path,
+    checkpoint_path: Path | None,
+    step: int,
+    epoch_eval: Mapping[str, Any] | None,
+    best_accuracy: float | None,
+    best_checkpoint_path: Path | None,
+) -> tuple[float | None, Path | None, bool]:
+    if checkpoint_path is None or epoch_eval is None:
+        return best_accuracy, best_checkpoint_path, False
+    if not is_post_lsp_weight_warmup_epoch(args, step):
+        return best_accuracy, best_checkpoint_path, False
+
+    eval_accuracy = float(epoch_eval["accuracy"])
+    if best_accuracy is not None and eval_accuracy <= best_accuracy:
+        return best_accuracy, best_checkpoint_path, False
+
+    alias_path = write_checkpoint_alias(
+        checkpoint_dir,
+        alias_name="best_post_warmup_eval_accuracy.pt",
+        checkpoint_path=checkpoint_path,
+        metadata={
+            **checkpoint_epoch_metadata(step, args.epoch_steps),
+            "accuracy": eval_accuracy,
+            "exact_match": epoch_eval["exact_match"],
+            "invalid_answer_rate": epoch_eval["invalid_answer_rate"],
+            "num_eval_samples": epoch_eval["num_eval_samples"],
+            "eval_metrics_path": epoch_eval["metrics_path"],
+            "step_metrics_path": epoch_eval["step_metrics_path"],
+            "lsp_weight": lsp_weight_for_step(args, step),
+            "lsp_weight_target": args.lsp_weight,
+            "lsp_weight_warmup_ratio": args.lsp_weight_warmup_ratio,
+            "lsp_weight_warmup_steps": args.resolved_lsp_weight_warmup_steps,
+            "lsp_weight_warmup_progress": lsp_weight_warmup_progress(args, step),
+            "post_warmup_eval_eligible": True,
+            "purpose": "highest eval accuracy checkpoint after LSP weight warmup",
+        },
+    )
+    return eval_accuracy, alias_path, True
+
+
+def prepare_coconut_initialization(args: argparse.Namespace) -> None:
+    args.resolved_init_coconut_checkpoint = None
+    args.init_coconut_checkpoint_metadata_path = None
+    args.init_coconut_checkpoint_metadata = {}
+    args.init_coconut_loaded_key_count = 0
+    args.init_coconut_load_target = None
+    if args.init_coconut_checkpoint is None:
+        return
+
+    path = resolve_repo_path(args.init_coconut_checkpoint)
+    metadata: Mapping[str, Any] = {}
+    metadata_path: Path | None = None
+    checkpoint_path = path
+    if path.suffix.lower() == ".json":
+        metadata_path = path
+        metadata = load_json_mapping(path, "Coconut checkpoint metadata")
+        checkpoint_ref = (
+            metadata.get("checkpoint_path")
+            or metadata.get("preserved_checkpoint_path")
+            or metadata.get("checkpoint")
+        )
+        if not checkpoint_ref:
+            raise ValueError(f"Coconut checkpoint metadata missing checkpoint_path: {path}")
+        checkpoint_path = Path(str(checkpoint_ref))
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = path.parent / checkpoint_path
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Coconut initialization checkpoint not found: {checkpoint_path}")
+
+    args.resolved_init_coconut_checkpoint = str(checkpoint_path)
+    args.init_coconut_checkpoint_metadata_path = str(metadata_path) if metadata_path else None
+    args.init_coconut_checkpoint_metadata = {
+        key: metadata[key]
+        for key in (
+            "checkpoint_type",
+            "epoch",
+            "completed_epoch",
+            "step",
+            "eval_loss",
+            "eval_accuracy",
+            "eval_correct",
+            "eval_total",
+            "updated_at",
+        )
+        if key in metadata
+    }
+
+
+def load_json_mapping(path: Path, description: str) -> Mapping[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"{description} not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"{description} must contain a JSON object: {path}")
+    return payload
+
+
+def load_coconut_initial_checkpoint(
+    path: Path,
+    *,
+    student: nn.Module,
+    device: torch.device,
+) -> dict[str, Any]:
+    checkpoint_path = resolve_repo_path(path)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Coconut initialization checkpoint not found: {checkpoint_path}")
+    checkpoint = torch_load_checkpoint(checkpoint_path, device=device)
+    state = extract_coconut_state_dict(checkpoint, checkpoint_path)
+    state = strip_module_prefix_if_present(state)
+    try:
+        student.load_state_dict(state, strict=True)
+        load_target = "coconut_student"
+    except RuntimeError as exc:
+        if not looks_like_base_causallm_state(state):
+            raise RuntimeError(
+                f"failed to load Coconut initialization checkpoint into student: {checkpoint_path}"
+            ) from exc
+        student.base_causallm.load_state_dict(state, strict=True)
+        load_target = "base_causallm"
+    return {"loaded_keys": len(state), "load_target": load_target}
+
+
+def torch_load_checkpoint(path: Path, *, device: torch.device) -> Any:
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def extract_coconut_state_dict(payload: Any, path: Path) -> Mapping[str, torch.Tensor]:
+    if is_tensor_state_dict(payload):
+        return payload
+    if isinstance(payload, Mapping):
+        for key in ("state_dict", "model_state_dict", "model"):
+            value = payload.get(key)
+            if is_tensor_state_dict(value):
+                return value
+    raise ValueError(f"Coconut initialization checkpoint has no tensor state dict: {path}")
+
+
+def is_tensor_state_dict(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and bool(value)
+        and all(isinstance(key, str) for key in value.keys())
+        and all(torch.is_tensor(item) for item in value.values())
+    )
+
+
+def strip_module_prefix_if_present(
+    state: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    if all(key.startswith("module.") for key in state):
+        return {key.removeprefix("module."): value for key, value in state.items()}
+    return dict(state)
+
+
+def looks_like_base_causallm_state(state: Mapping[str, torch.Tensor]) -> bool:
+    return not any(
+        key.startswith("base_causallm.") or key.startswith("embedding.")
+        for key in state
+    )
+
+
 def load_training_checkpoint(
     path: Path,
     *,
@@ -1808,26 +2456,104 @@ def maybe_save_checkpoint(
         return None
     if step != args.max_steps and step % args.save_every != 0:
         return None
-    path = checkpoint_dir / f"step_{step:06d}.pt"
-    torch.save(
-        {
-            "step": step,
-            "student_base_causallm": student.base_causallm.state_dict(),
-            "ema_teacher": ema_teacher.teacher_model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "config": {
-                "max_steps": args.max_steps,
-                "objective": args.objective,
-                "ema_decay": args.ema_decay,
-                "lsp_weight": args.lsp_weight,
-                "host_answer_ce_weight": args.host_answer_ce_weight,
-                "anti_collapse_type": args.anti_collapse_type,
-                "anti_collapse_weight": args.anti_collapse_weight,
-            },
+    path = checkpoint_dir / "latest.pt"
+    tmp_path = checkpoint_dir / f".latest.pt.{os.getpid()}.{step}.tmp"
+    payload = {
+        "step": step,
+        "student_base_causallm": student.base_causallm.state_dict(),
+        "ema_teacher": ema_teacher.teacher_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": {
+            "max_steps": args.max_steps,
+            "objective": args.objective,
+            "ema_decay": args.ema_decay,
+            "lsp_weight": args.lsp_weight,
+            "lsp_weight_warmup_ratio": args.lsp_weight_warmup_ratio,
+            "lsp_weight_warmup_steps": args.resolved_lsp_weight_warmup_steps,
+            "host_answer_ce_weight": args.host_answer_ce_weight,
+            "anti_collapse_type": args.anti_collapse_type,
+            "anti_collapse_weight": args.anti_collapse_weight,
+            "init_coconut_checkpoint": args.resolved_init_coconut_checkpoint,
+            "mapping_strategy": getattr(args, "mapping_strategy", "one_to_one"),
+            "latent_count_mode": getattr(args, "latent_count_mode", "teacher_steps"),
+            "num_latent_steps": getattr(args, "num_latent_steps", None),
+            "eval_num_latent_steps": getattr(args, "resolved_eval_num_latent_steps", getattr(args, "num_latent_steps", None)),
+            "latent_tokens_per_teacher_step": getattr(args, "latent_tokens_per_teacher_step", 1),
+            "max_teacher_step_groups": (
+                max_teacher_step_groups_for_args(args)
+                if hasattr(args, "max_teacher_step_groups") and hasattr(args, "latent_tokens_per_teacher_step")
+                else None
+            ),
+            "teacher_step_selection": getattr(args, "teacher_step_selection", "all"),
         },
-        path,
-    )
+    }
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
     return path
+
+
+def write_checkpoint_alias(
+    checkpoint_dir: Path,
+    *,
+    alias_name: str,
+    checkpoint_path: Path,
+    metadata: Mapping[str, Any],
+) -> Path:
+    alias_path = checkpoint_dir / alias_name
+    replace_checkpoint_alias(checkpoint_path, alias_path)
+    metadata_path = alias_path.with_suffix(".json")
+    write_json(
+        metadata_path,
+        {
+            **metadata,
+            "checkpoint_path": str(alias_path),
+        },
+    )
+    return alias_path
+
+
+def replace_checkpoint_alias(checkpoint_path: Path, alias_path: Path) -> None:
+    alias_path.parent.mkdir(parents=True, exist_ok=True)
+    if alias_path.exists():
+        try:
+            if os.path.samefile(checkpoint_path, alias_path):
+                return
+        except OSError:
+            pass
+    tmp_path = alias_path.with_name(
+        f".{alias_path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp"
+    )
+    tmp_path.unlink(missing_ok=True)
+    try:
+        try:
+            os.link(checkpoint_path, tmp_path)
+        except OSError:
+            # Same-filesystem hard links are expected under /root/autodl-tmp.
+            # Fall back to a symlink rather than duplicating multi-GB checkpoints.
+            os.symlink(checkpoint_path, tmp_path)
+        os.replace(tmp_path, alias_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def load_best_checkpoint_metric(
+    metadata_path: Path,
+    metric_name: str,
+) -> tuple[float | None, Path | None]:
+    if not metadata_path.exists():
+        return None, None
+    try:
+        metadata = load_json_mapping(metadata_path, f"{metadata_path.name} metadata")
+    except ValueError:
+        return None, None
+    metric_value = metadata.get(metric_name)
+    checkpoint_value = metadata.get("checkpoint_path") or metadata.get("source_checkpoint_path")
+    if not isinstance(metric_value, (int, float)) or checkpoint_value is None:
+        return None, None
+    checkpoint_path = Path(str(checkpoint_value))
+    if not checkpoint_path.exists():
+        return None, None
+    return float(metric_value), checkpoint_path
 
 
 def prune_old_checkpoints(
@@ -1880,13 +2606,16 @@ def maybe_run_epoch_eval(
     eval_output_dir: Path,
     eval_metrics_path: Path,
     device: torch.device,
+    training_diagnostics: Mapping[str, Any] | None = None,
+    force: bool = False,
+    extra_metrics: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    if args.eval_every <= 0:
+    if not force and args.eval_every <= 0:
         return None
-    if step != args.max_steps and step % args.eval_every != 0:
+    if not force and step != args.max_steps and step % args.eval_every != 0:
         return None
     if not eval_samples:
-        raise RuntimeError("eval_every is enabled but no eval samples were loaded")
+        raise RuntimeError("eval is enabled but no eval samples were loaded")
 
     was_training = student.training
     student.eval()
@@ -1900,7 +2629,7 @@ def maybe_run_epoch_eval(
             input_ids = build_final_answer_eval_input_ids(
                 tokenizer,
                 sample.question,
-                num_latent_steps=args.num_latent_steps,
+                num_latent_steps=args.resolved_eval_num_latent_steps,
                 device=device,
             )
             outputs = student.generate(
@@ -1964,6 +2693,13 @@ def maybe_run_epoch_eval(
         "generated_length_mean": mean(generated_lengths),
         "num_eval_samples": total,
         "limit_eval_samples": args.eval_limit_samples,
+        "eval_num_latent_steps": args.resolved_eval_num_latent_steps,
+        "train_num_latent_steps": args.num_latent_steps,
+        "latent_tokens_per_teacher_step": args.latent_tokens_per_teacher_step,
+        "max_teacher_step_groups": max_teacher_step_groups_for_args(args),
+        "teacher_step_selection": args.teacher_step_selection,
+        "mapping_strategy": args.mapping_strategy,
+        "latent_count_mode": args.latent_count_mode,
         "eval_json": str(resolve_repo_path(args.eval_json)) if args.eval_json else None,
         "eval_split": args.eval_split,
         "dataset_id": args.eval_dataset_id,
@@ -1985,6 +2721,12 @@ def maybe_run_epoch_eval(
         "metrics_path": str(eval_metrics_path),
         "step_metrics_path": str(step_metrics_path),
     }
+    if extra_metrics is not None:
+        metrics.update(dict(extra_metrics))
+    if training_diagnostics is not None:
+        diagnostics = dict(training_diagnostics)
+        metrics.update(diagnostics)
+        metrics["training_diagnostics"] = diagnostics
     write_json(step_metrics_path, metrics)
     write_json(eval_output_dir / "latest.json", metrics)
     append_metrics(eval_metrics_path, metrics)
@@ -1996,11 +2738,21 @@ def compact_eval_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "step": metrics["step"],
         "epoch_index": metrics["epoch_index"],
+        "is_step0_baseline": metrics.get("is_step0_baseline", False),
         "checkpoint_path": metrics["checkpoint_path"],
+        "baseline_checkpoint_path": metrics.get("baseline_checkpoint_path"),
         "accuracy": metrics["accuracy"],
         "exact_match": metrics["exact_match"],
         "invalid_answer_rate": metrics["invalid_answer_rate"],
         "num_eval_samples": metrics["num_eval_samples"],
+        "eval_num_latent_steps": metrics.get("eval_num_latent_steps"),
+        "mapping_strategy": metrics.get("mapping_strategy"),
+        "latent_tokens_per_teacher_step": metrics.get("latent_tokens_per_teacher_step"),
+        "effective_rank": metrics.get("effective_rank"),
+        "effective_rank_all_latents": metrics.get("effective_rank_all_latents"),
+        "effective_rank_status": metrics.get("effective_rank_status"),
+        "latent_variance_mean": metrics.get("latent_variance_mean"),
+        "lsp_to_ce_ratio": metrics.get("lsp_to_ce_ratio"),
         "step_metrics_path": metrics["step_metrics_path"],
     }
 
@@ -2180,6 +2932,18 @@ def build_config_snapshot(
                 else "LSP-JEPA-Core SequenceFinal train"
             ),
         },
+        "initialization": {
+            "coconut_checkpoint": (
+                str(args.init_coconut_checkpoint)
+                if args.init_coconut_checkpoint is not None
+                else None
+            ),
+            "resolved_coconut_checkpoint": args.resolved_init_coconut_checkpoint,
+            "metadata_path": args.init_coconut_checkpoint_metadata_path,
+            "metadata": args.init_coconut_checkpoint_metadata,
+            "loaded_key_count": args.init_coconut_loaded_key_count,
+            "load_target": args.init_coconut_load_target,
+        },
         "teacher": {
             "ema_decay": args.ema_decay,
             "update_trainable_only": True,
@@ -2199,6 +2963,7 @@ def build_config_snapshot(
         "student": {
             "latent_arch": "latent_tokens",
             "num_latent_steps": args.num_latent_steps,
+            "latent_count_mode": args.latent_count_mode,
             "latent_dim": None,
             "normalize_latents": True,
             "detach_between_steps": False,
@@ -2209,15 +2974,26 @@ def build_config_snapshot(
             "transition_weight": 0.0,
         },
         "mapping": {
-            "strategy": "one_to_one" if args.objective == "step_trajectory" else "sequence",
+            "strategy": args.mapping_strategy if args.objective == "step_trajectory" else "sequence",
+            "latent_tokens_per_teacher_step": args.latent_tokens_per_teacher_step,
+            "max_teacher_step_groups": max_teacher_step_groups_for_args(args),
+            "teacher_step_selection": args.teacher_step_selection,
+            "student_group_end_indices_1based": [
+                (index + 1) * int(args.latent_tokens_per_teacher_step)
+                for index in range(max_teacher_step_groups_for_args(args))
+            ] if args.objective == "step_trajectory" and args.mapping_strategy == "grouped_step_end" else [],
             "sparse_positions": ["first", "middle", "final"],
             "attention_coverage_weight": 0.0,
         },
         "loss": {
             "alignment": args.alignment_loss,
             "align_weight": args.lsp_weight,
+            "lsp_weight_warmup_ratio": args.lsp_weight_warmup_ratio,
+            "lsp_weight_warmup_steps": args.resolved_lsp_weight_warmup_steps,
+            "initial_effective_lsp_weight": lsp_weight_for_step(args, 1),
             "anti_collapse": args.anti_collapse_type,
             "anti_collapse_weight": args.anti_collapse_weight,
+            "anti_collapse_scope": "all_student_latents",
             "answer_readout_weight": 0.0,
         },
         "host_losses": {
@@ -2283,6 +3059,8 @@ def build_config_snapshot(
         "eval": {
             "every_steps": args.eval_every,
             "every_epoch": args.eval_every_epoch,
+            "before_train": args.eval_before_train,
+            "num_latent_steps": args.resolved_eval_num_latent_steps,
             "output_dir": args.eval_output_dir,
             "metrics_path": args.eval_metrics_path,
             "eval_json": str(args.eval_json) if args.eval_json else None,
@@ -2428,13 +3206,26 @@ def build_summary(
             "checkpoint_keep_last": args.keep_last_checkpoints,
             "best_total_loss": last.get("best_total_loss"),
             "best_checkpoint_path": last.get("best_checkpoint_path"),
+            "best_eval_accuracy": last.get("best_eval_accuracy"),
+            "best_eval_checkpoint_path": last.get("best_eval_checkpoint_path"),
+            "best_post_warmup_eval_accuracy": last.get("best_post_warmup_eval_accuracy"),
+            "best_post_warmup_eval_checkpoint_path": last.get(
+                "best_post_warmup_eval_checkpoint_path"
+            ),
             "epoch_steps": args.epoch_steps,
+            "init_coconut_checkpoint": args.resolved_init_coconut_checkpoint,
+            "init_coconut_checkpoint_metadata": args.init_coconut_checkpoint_metadata,
         },
         "loss_curve": {
             "first_total_loss": float(first["total_loss"]),
             "last_total_loss": float(last["total_loss"]),
             "first_lsp_loss": first_lsp,
             "last_lsp_loss": last_lsp,
+            "lsp_weight_target": args.lsp_weight,
+            "lsp_weight_first": float(first["lsp_weight"]),
+            "lsp_weight_last": float(last["lsp_weight"]),
+            "lsp_weight_warmup_ratio": args.lsp_weight_warmup_ratio,
+            "lsp_weight_warmup_steps": args.resolved_lsp_weight_warmup_steps,
             "tail_lsp_loss_mean": tail_lsp_mean,
             "lsp_loss_delta_last_minus_first": last_lsp - first_lsp,
             "loss_stability_ratio": args.loss_stability_ratio,
@@ -2859,6 +3650,12 @@ def param_delta_l1(before: dict[str, torch.Tensor], module: nn.Module) -> float:
 
 def to_float(value: torch.Tensor) -> float:
     return float(value.detach().cpu().item())
+
+
+def safe_float_ratio(numerator: float, denominator: float, *, eps: float = 1e-12) -> float | None:
+    if abs(denominator) <= eps:
+        return None
+    return numerator / denominator
 
 
 def tensor_to_int_list(value: torch.Tensor) -> list[int]:
