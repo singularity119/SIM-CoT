@@ -524,3 +524,31 @@ Ablations：
 - 记录 invalid samples 和 failed target extraction；不要静默丢弃。
 - Comments 聚焦于不直观的 research logic，而不是通用 Python 行为。
 - 不要隐藏 failed examples、collapse runs 或 invalid trajectory counts。
+
+---
+
+## Project context
+This repo is for ML experiments. Do not modify archived runs or generated logs.
+
+## Environment
+- Use `uv` for Python dependency management.
+- Run commands from the repository root.
+- Never install packages globally.
+
+## Test / validation
+- For Python changes, run:
+  `uv run pytest tests -q`
+- For experiment scripts, run a smoke test:
+  `uv run python scripts/train.py --dry-run --seed 0`
+
+## Coding rules
+- Keep changes minimal.
+- Do not change public APIs unless asked.
+- Prefer explicit config over hard-coded constants.
+
+## Reporting
+After each task, report:
+1. files changed
+2. commands run
+3. test result
+4. remaining risks
